@@ -30,14 +30,68 @@ def copy_source(src: Path, dst: Path) -> bool:
 
 
 def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
-    """Copy sources listed in debugsources.list that belong to this recipe."""
-    debugsources = pkg_info.work_ver / "debugsources.list"
-    paths = yu.read_debugsources(debugsources)
-    prefix = pkg_info.recipe_prefix   # /usr/src/debug/<recipe>/<ver>/
+    """
+    Copy sources for a userspace package.
 
-    counts = {"c": 0, "h": 0, "S": 0, "missing": 0}
+    Uses per-binary DWARF CU extraction (readelf on installed .debug files)
+    to identify exactly which source files were compiled into *this* package's
+    installed binaries, giving accurate per-package counts even when multiple
+    packages share the same recipe (e.g. libc6 vs ldconfig from glibc).
+
+    Falls back to debugsources.list if no ELF binaries with debug info are
+    found for this package.
+    """
+    split_root = pkg_info.work_ver / "packages-split"
+    pkg_split  = split_root / pkg_info.yocto_pkg
+    prefix     = pkg_info.recipe_prefix   # /usr/src/debug/<recipe>/<ver>/
+
+    counts  = {"c": 0, "h": 0, "S": 0, "missing": 0}
     pkg_out = out_dir / pkg_info.installed_name
 
+    # ── Try DWARF-based per-binary collection ──────────────────────────────
+    installed_elfs = yu.find_installed_elfs(pkg_split)
+    if installed_elfs:
+        dwarf_rels: set[str] = set()
+        for elf in installed_elfs:
+            dbg = yu.find_debug_counterpart(elf, pkg_split)
+            target = dbg if (dbg and dbg.exists()) else elf
+            for path in yu.extract_dwarf_cu_sources(target):
+                if path.startswith(prefix):
+                    rel = path[len(prefix):]
+                    if rel and not rel.startswith("<"):
+                        dwarf_rels.add(rel)
+
+        if dwarf_rels:
+            # Collect .c / .S from DWARF CU list
+            for rel in dwarf_rels:
+                src = pkg_info.work_ver / rel
+                ext = Path(rel).suffix.lstrip(".")
+                if copy_source(src, pkg_out / rel):
+                    if ext in counts:
+                        counts[ext] += 1
+                else:
+                    counts["missing"] += 1
+
+            # Also collect .h files from debugsources.list (DWARF CU level
+            # only tracks compilation units, not included headers).
+            debugsources = pkg_info.work_ver / "debugsources.list"
+            if debugsources.exists():
+                for debug_path in yu.read_debugsources(debugsources):
+                    if not debug_path.startswith(prefix):
+                        continue
+                    rel = debug_path[len(prefix):]
+                    if not rel or rel.startswith("<"):
+                        continue
+                    if not rel.endswith(".h"):
+                        continue
+                    src = pkg_info.work_ver / rel
+                    if copy_source(src, pkg_out / rel):
+                        counts["h"] += 1
+            return counts
+
+    # ── Fallback: recipe-level debugsources.list ───────────────────────────
+    debugsources = pkg_info.work_ver / "debugsources.list"
+    paths = yu.read_debugsources(debugsources)
     for debug_path in paths:
         if not debug_path.startswith(prefix):
             continue
@@ -51,24 +105,29 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                 counts[ext] += 1
         else:
             counts["missing"] += 1
-
     return counts
 
 
 def collect_kernel_image(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
     """
     Collect sources for the kernel image (built-in code).
-    Finds all .o files in the build dir that are NOT owned by any kernel
-    module, then copies the corresponding .c/.S from kernel-source/.
+
+    Step 1 — .c / .S: for every non-module .o in the build dir, copy the
+    matching source file from kernel-source/.
+
+    Step 2 — .h: Kbuild writes a .*.o.cmd file alongside each .o that lists
+    every header the compiler read (Makefile deps format).  Parse those to
+    collect the exact set of headers used, from kernel-source/ only.
     """
     k = pkg_info.kernel
     if k is None:
-        return {"c": 0, "S": 0, "missing": 0, "error": "no kernel info"}
+        return {"c": 0, "S": 0, "h": 0, "missing": 0, "error": "no kernel info"}
 
     module_objs = k.module_objs()
     pkg_out = out_dir / pkg_info.installed_name
-    counts = {"c": 0, "S": 0, "missing": 0}
+    counts = {"c": 0, "S": 0, "h": 0, "missing": 0}
 
+    # ── Step 1: source files (.c / .S) ────────────────────────────────────
     for o_file in k.build_dir.rglob("*.o"):
         if o_file in module_objs:
             continue
@@ -80,6 +139,44 @@ def collect_kernel_image(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
             if copy_source(src, pkg_out / rel.parent / src.name):
                 counts["c" if ext == ".c" else "S"] += 1
                 break
+
+    # ── Step 2: headers from Kbuild .cmd dependency files ─────────────────
+    # Kbuild writes  build/path/.foo.o.cmd  for each  build/path/foo.o
+    # The file contains the compile command on line 1, then the header deps:
+    #   deps_path/foo.o := \
+    #     /abs/path/header1.h \
+    #     /abs/path/header2.h \
+    # We collect only headers that live under kernel-source/.
+    src_prefix = str(k.src_dir)
+    collected_h: set[str] = set()
+
+    for o_file in k.build_dir.rglob("*.o"):
+        if o_file in module_objs:
+            continue
+        if o_file.name.startswith(".") or o_file.name.endswith(".mod.o"):
+            continue
+        # .cmd file sits beside the .o with a leading dot
+        cmd_file = o_file.parent / f".{o_file.name}.cmd"
+        if not cmd_file.exists():
+            continue
+        try:
+            text = cmd_file.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            h = line.strip().rstrip("\\").strip()
+            if not h.endswith(".h") or not h.startswith(src_prefix):
+                continue
+            if h in collected_h:
+                continue
+            h_path = Path(h)
+            try:
+                rel_h = h_path.relative_to(k.src_dir)
+            except ValueError:
+                continue
+            if copy_source(h_path, pkg_out / rel_h):
+                collected_h.add(h)
+                counts["h"] += 1
 
     return counts
 
@@ -195,7 +292,7 @@ def main():
             if not kernel_image_done.get(key):
                 counts = collect_kernel_image(pkg, out_dir)
                 kernel_image_done[key] = True
-                print(f"  → c={counts['c']}  S={counts['S']}  missing={counts['missing']}")
+                print(f"  → c={counts['c']}  h={counts['h']}  S={counts['S']}  missing={counts['missing']}")
             else:
                 # Sibling image package — note it shares sources
                 note_dir = out_dir / pkg.installed_name
