@@ -383,7 +383,7 @@ function renderDetail(d){{
       ${{d.S?`<div class="detail-section">
         <h4 style="color:#27ae60">.S assembly files <span class="cnt">${{d.S}}</span></h4>
         ${{fileList(d.s_files,'f-s',d.S)}}
-      </div>`:'}}
+      </div>`:''}}
       ${{covSection}}
     </div>
   </div>`;
