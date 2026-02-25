@@ -223,15 +223,17 @@ def check_coverage(
 # ── Compile test ──────────────────────────────────────────────────────────────
 
 def _make_shadow_cmd(
-    cmd: CompileCmd, collected_src: Path, out_obj: Path
+    cmd: CompileCmd, collected_src: Path, out_obj: Path,
+    work_ver: Path | None = None,
 ) -> str:
     """
     Build a modified compile command that:
       • replaces the source file argument with collected_src (absolute)
       • replaces the -o argument with out_obj (absolute)
-      • adds -I<original_source_dir> so #include "..." relative to the
-        original source file's directory still resolves (GCC searches the
-        source file's own directory first for quoted includes)
+      • strips backtick shell-expansion spans (VPATH source resolution)
+      • adds -iquote paths for original source ancestor directories so
+        transitive #include "..." from collected headers can find sibling
+        files in the original source tree
     All other flags (sysroot, -I, -D, etc.) are kept verbatim.
     Command still runs with cwd = cmd.cwd.
     """
@@ -240,44 +242,73 @@ def _make_shadow_cmd(
     except ValueError:
         return cmd.cmd
 
+    # Pre-filter: remove backtick shell-expansion spans.
+    # These are VPATH-style constructs like:
+    #   `test -f 'lib/strutils.c' || echo '../util-linux-2.37.4/'`lib/strutils.c
+    # shlex.split breaks them into multiple tokens containing backticks
+    # plus orphan tokens (e.g. "-f", "'lib/strutils.c'") between them.
+    # We strip everything from the first backtick token through the last
+    # backtick token (inclusive); the resolved source path is already known.
+    filtered: list[str] = []
+    first_bt = last_bt = -1
+    for j, t in enumerate(tokens):
+        if "`" in t:
+            if first_bt < 0:
+                first_bt = j
+            last_bt = j
+    if first_bt >= 0:
+        filtered = tokens[:first_bt] + tokens[last_bt + 1:]
+    else:
+        filtered = tokens
+
     new_tokens: list[str] = []
     src_done = obj_done = False
     i = 0
-    while i < len(tokens):
-        if tokens[i] == "-o" and i + 1 < len(tokens) and not obj_done:
+    while i < len(filtered):
+        if filtered[i] == "-o" and i + 1 < len(filtered) and not obj_done:
             new_tokens += ["-o", str(out_obj)]
             obj_done = True
             i += 2
-        elif (not tokens[i].startswith("-") and not src_done
-              and any(tokens[i].endswith(e) for e in _SOURCE_EXTS)):
+        elif (not filtered[i].startswith("-") and not src_done
+              and any(filtered[i].endswith(e) for e in _SOURCE_EXTS)):
             new_tokens.append(str(collected_src))
             src_done = True
             i += 1
         else:
-            new_tokens.append(tokens[i])
+            new_tokens.append(filtered[i])
             i += 1
+
+    # If no source file token was found (e.g. stripped with backtick span),
+    # append the collected source explicitly.
+    if not src_done:
+        new_tokens.append(str(collected_src))
 
     # If no -o was found, append it
     if not obj_done:
         new_tokens += ["-o", str(out_obj)]
 
-    # Add the original source directory and all its subdirectories as *quoted*
-    # include search paths.  This ensures:
+    # Add the original source directory and its ancestor directories (up to
+    # work_ver) as quoted include search paths.  This ensures:
     #   - '#include "header.h"' from the source file itself still resolves
     #     to the original, even when compiled from the collected copy.
-    #   - '#include "header.h"' inside transitively-#include'd .c files (a
-    #     pattern used by e.g. busybox/unxz) can also find headers relative
-    #     to their original subdirectory in the source tree.
+    #   - '#include "file.def"' inside transitively-included headers can
+    #     find sibling files at any directory level in the original tree
+    #     (e.g. glibc's localeinfo.h including categories.def).
     # Using -iquote (not -I) keeps system '#include <...>' lookups unaffected,
     # preventing project-local files from shadowing system headers.
     orig_src_dir = cmd.src.parent
     new_tokens.append(f"-iquote{orig_src_dir}")
-    try:
-        for subdir in orig_src_dir.iterdir():
-            if subdir.is_dir():
-                new_tokens.append(f"-iquote{subdir}")
-    except OSError:
-        pass
+
+    # Walk ancestor directories from orig_src_dir up to (but not including)
+    # work_ver, adding each as -iquote so transitive includes resolve.
+    if work_ver:
+        d = orig_src_dir.parent
+        try:
+            while d != work_ver and d.is_relative_to(work_ver):
+                new_tokens.append(f"-iquote{d}")
+                d = d.parent
+        except (ValueError, OSError):
+            pass
 
     return shlex.join(new_tokens)
 
@@ -343,6 +374,39 @@ def compile_test(
 
     build_env = _get_build_env(pkg.work_ver)
 
+    # Symlink missing data-include files (.def, .tbl) into the collected
+    # tree.  Collected headers may #include "categories.def" etc., and GCC
+    # looks in the including file's directory first.  Without the symlinks,
+    # GCC finds the collected .h but not its sibling .def/.tbl file.
+    # Using symlinks avoids -iquote manipulation that can shadow headers.
+    _INCLUDE_DATA_EXTS = {".def", ".tbl"}
+    _data_symlinks: list[Path] = []
+    try:
+        for first_cmd in cmds:
+            try:
+                first_rel = first_cmd.src.relative_to(pkg.work_ver)
+                src_root = pkg.work_ver / first_rel.parts[0]
+                for dirpath, _dirs, files in os.walk(pkg_sources):
+                    if not any(f.endswith(".h") for f in files):
+                        continue
+                    reldir = Path(dirpath).relative_to(pkg_sources)
+                    orig_dir = src_root / reldir
+                    if not orig_dir.is_dir():
+                        continue
+                    collected_dir = Path(dirpath)
+                    for f in orig_dir.iterdir():
+                        if (f.is_file()
+                                and f.suffix in _INCLUDE_DATA_EXTS
+                                and not (collected_dir / f.name).exists()):
+                            link = collected_dir / f.name
+                            link.symlink_to(f)
+                            _data_symlinks.append(link)
+                break
+            except (ValueError, IndexError):
+                continue
+    except OSError:
+        pass
+
     with tempfile.TemporaryDirectory(dir=work_dir, prefix=f"test_{pkg.installed_name}_") as tmp:
         tmp_path = Path(tmp)
 
@@ -363,7 +427,8 @@ def compile_test(
 
             results["total"] += 1
             out_obj = tmp_path / f"{idx}.o"
-            new_cmd = _make_shadow_cmd(cmd, collected_src, out_obj)
+            new_cmd = _make_shadow_cmd(cmd, collected_src, out_obj,
+                                      work_ver=pkg.work_ver)
 
             if verbose:
                 short = new_cmd[:140] + ("…" if len(new_cmd) > 140 else "")
@@ -408,6 +473,13 @@ def compile_test(
                 if orig != new:
                     results["mismatch"] += 1
                     results["mismatches"].append(str(rel))
+
+    # Clean up data-include symlinks
+    for link in _data_symlinks:
+        try:
+            link.unlink()
+        except OSError:
+            pass
 
     if results["fail"]:
         results["status"] = "FAIL"

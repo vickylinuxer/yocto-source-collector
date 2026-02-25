@@ -54,6 +54,10 @@ Uses DWARF per-binary collection for userspace; `.o`-based collection for kernel
 
 **`report.py`** — Generates a self-contained HTML report with Chart.js. Imports `check_coverage` from `test_sources.py`.
 
+### Cross-script data flow
+
+`collect_sources.py` and `report.py` both import from `test_sources.py` (`parse_compile_log`, `check_coverage`). Changes to the compile-log parsing or coverage API affect all three scripts.
+
 ## Key Patterns
 
 - Package types: `userspace`, `kernel_image`, `kernel_module`, `no_source` — all scripts branch on `pkg.pkg_type`
@@ -61,3 +65,13 @@ Uses DWARF per-binary collection for userspace; `.o`-based collection for kernel
 - Recipe prefix: `/usr/src/debug/{recipe}/{ver}/` — used to filter DWARF paths to same-recipe sources
 - External tools required: `readelf` (DWARF), `objcopy` (.o comparison)
 - `.o` mismatch in compile tests is expected (due to `-fdebug-prefix-map`) and reported separately from failures
+
+## Compile Test Internals (`test_sources.py --compile`)
+
+The compile test replays original gcc commands with the collected source copy via `_make_shadow_cmd`. Key subtleties:
+
+- **Backtick VPATH expansion**: Some build systems (e.g. util-linux) use `` `test -f 'src.c' || echo '../pkg-ver/'`src.c `` in commands. `shlex.split` breaks these into orphan tokens. `_make_shadow_cmd` strips the entire backtick span and appends the collected source explicitly.
+
+- **Data-include symlinks**: Collected headers may `#include "file.def"` or `#include "file.tbl"` — non-header files that aren't collected. Before running compile tests, the code symlinks missing `.def`/`.tbl` files from the original tree into the collected directories (and cleans them up after). This avoids `-iquote` manipulation which risks shadowing configured headers.
+
+- **Ancestor `-iquote` paths**: `_make_shadow_cmd` adds `-iquote` for the original source file's parent directory and its ancestors up to `work_ver`, so `#include "..."` from the collected copy resolves headers in the original tree.
