@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SOURCE_EXTS = {".c", ".h", ".S", ".s"}
+SOURCE_EXTS = {".c", ".h", ".S", ".s", ".cpp", ".cc", ".cxx", ".C"}
 
 # File names that indicate a kernel image package
 KERNEL_IMAGE_GLOBS = ("bzImage*", "zImage*", "Image", "vmlinuz*",
@@ -298,7 +298,7 @@ def extract_dwarf_cu_sources(elf_path: Path, timeout: int = 180) -> set[str]:
             m = _ATTR_RE.search(line)
             if m:
                 val = m.group(1).strip().rstrip(")")
-                if val.endswith((".c", ".h", ".S", ".s")):
+                if val.endswith((".c", ".h", ".S", ".s", ".cpp", ".cc", ".cxx", ".C")):
                     cu_name = val
         elif "DW_AT_comp_dir" in line and cu_comp_dir is None:
             m = _ATTR_RE.search(line)
@@ -491,8 +491,11 @@ def read_debugsources(path: Path) -> list[str]:
     ]
 
 
+_COLLECTION_SUBDIRS = frozenset({"_compiled_not_used", "_never_used"})
+
+
 def list_collected_files(output_dir: Path, pkg: str) -> set[str]:
-    """Relative paths of all source files under output_dir/pkg/."""
+    """Relative paths of all source files under output_dir/pkg/ (excludes category subdirs)."""
     d = output_dir / pkg
     if not d.exists():
         return set()
@@ -500,7 +503,36 @@ def list_collected_files(output_dir: Path, pkg: str) -> set[str]:
         str(p.relative_to(d))
         for p in d.rglob("*")
         if p.is_file() and p.suffix in SOURCE_EXTS
+        and p.relative_to(d).parts[0] not in _COLLECTION_SUBDIRS
     }
+
+
+def strip_src_root(rel: str) -> str:
+    """Strip the leading source-root component from a work-dir-relative path.
+
+    Yocto unpacks sources into a versioned subdirectory of WORKDIR:
+      busybox-1.35.0/archival/...  →  archival/...
+      git/socket.c                 →  socket.c
+      dropbear-2020.81/svr-auth.c  →  svr-auth.c
+
+    The first path component is an unpack/fetch artifact and adds no
+    information when stored in the per-package output directory.
+    """
+    parts = Path(rel).parts
+    return str(Path(*parts[1:])) if len(parts) > 1 else rel
+
+
+def is_build_dir(dirname: str) -> bool:
+    """Return True if dirname looks like an out-of-source build directory."""
+    n = dirname.lower()
+    if n in ("build", "builds", "_build", ".build"):
+        return True
+    if n.startswith("build-") or n.endswith("-build"):
+        return True
+    # Cross-compile tuples like x86_64-poky-linux or aarch64-oe-linux
+    if re.search(r"^[a-z0-9_]+-(?:poky|oe)-", n):
+        return True
+    return False
 
 
 # ── Shared argparse helpers ───────────────────────────────────────────────────

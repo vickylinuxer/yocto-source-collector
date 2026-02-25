@@ -53,7 +53,9 @@ def verify_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
             debug_found += 1
         for path in yu.extract_dwarf_cu_sources(target):
             if path.startswith(prefix):
-                dwarf_sources.add(path[len(prefix):])
+                rel = path[len(prefix):]
+                if rel and not rel.startswith("<"):
+                    dwarf_sources.add(yu.strip_src_root(rel))
 
     if not dwarf_sources:
         return {

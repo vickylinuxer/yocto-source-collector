@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """
-Collect compiled source files (.c, .h, .S) per installed package.
+Collect sources per installed package in three categories:
 
-Uses Yocto's debugsources.list (DWARF-derived) for userspace packages,
-and kernel .mod files for kernel packages — ensuring only sources actually
-compiled into installed binaries are collected.
+  compiled+used        Sources compiled into the installed binary (DWARF-confirmed).
+                       Stored directly under <out>/<pkg>/
+
+  compiled+not-used    Sources compiled (in log.do_compile) but not in the installed
+                       binary — optional features, static libs, test utilities.
+                       Stored under <out>/<pkg>/_compiled_not_used/
+
+  never-compiled       Files that exist in the recipe source tree but were never
+                       compiled.  All non-binary file types are collected (scripts,
+                       configs, makefiles, docs, headers, …).
+                       Stored under <out>/<pkg>/_never_used/
+
+Source-root prefixes (busybox-1.35.0/, git/, etc.) are stripped from all paths.
 
 Usage:
   python3 collect_sources.py -b /path/to/build -m core-image-minimal -o ./sources
@@ -13,7 +23,6 @@ Usage:
 
 import argparse
 import shutil
-import sys
 from pathlib import Path
 
 import yocto_source_utils as yu
@@ -29,29 +38,93 @@ def copy_source(src: Path, dst: Path) -> bool:
     return True
 
 
+def _get_compiled_srcs(work_ver: Path) -> set[Path]:
+    """Return absolute paths of all files compiled per log.do_compile."""
+    log_file = work_ver / "temp" / "log.do_compile"
+    if not log_file.exists():
+        return set()
+    try:
+        from test_sources import parse_compile_log, _get_initial_cwd
+        cwd = _get_initial_cwd(work_ver)
+        cmds = parse_compile_log(log_file, cwd)
+        return {cmd.src for cmd in cmds}
+    except Exception:
+        return set()
+
+
+# Extensions that are almost certainly binary artifacts (skip during never-used walk)
+_BINARY_EXTS = frozenset({
+    ".o", ".a", ".so", ".ko", ".lo", ".la", ".lib", ".dll", ".exe",
+    ".pyc", ".pyo", ".pyd", ".class", ".beam",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".tiff", ".tif",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".gz", ".bz2", ".xz", ".lz4", ".zst", ".lzma", ".tar", ".rar",
+    ".mo",    # gettext compiled message catalog
+    ".gmo",   # same
+})
+
+_COLLECT_CAP = 20_000   # max files per category per package
+
+
+def _is_collectible(f: Path) -> bool:
+    """Return True if f is likely a source or config file (not a binary artifact)."""
+    if f.suffix.lower() in _BINARY_EXTS:
+        return False
+    try:
+        return f.stat().st_size < 2_000_000   # skip files >2 MB
+    except OSError:
+        return False
+
+
+def _collect_category(
+    srcs: list[tuple[Path, str]],   # [(src_path, dst_rel), ...]
+    out_dir: Path,
+) -> int:
+    """Copy (src_path → out_dir/dst_rel) for each pair. Returns file count."""
+    count = 0
+    for src, dst_rel in srcs:
+        if copy_source(src, out_dir / dst_rel):
+            count += 1
+            if count >= _COLLECT_CAP:
+                print(f"    [WARN] cap {_COLLECT_CAP} reached in {out_dir.name}/")
+                break
+    return count
+
+
+# ── Userspace collection ──────────────────────────────────────────────────────
+
 def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
     """
-    Copy sources for a userspace package.
+    Collect sources for a userspace package in three categories:
 
-    Uses per-binary DWARF CU extraction (readelf on installed .debug files)
-    to identify exactly which source files were compiled into *this* package's
-    installed binaries, giving accurate per-package counts even when multiple
-    packages share the same recipe (e.g. libc6 vs ldconfig from glibc).
+      compiled+used        → <pkg>/          (DWARF-confirmed, per-binary)
+      compiled+not-used    → <pkg>/_compiled_not_used/
+      never-compiled       → <pkg>/_never_used/  (all non-binary file types)
 
-    Falls back to debugsources.list if no ELF binaries with debug info are
-    found for this package.
+    Source-root prefixes (busybox-1.35.0/, git/, …) are stripped.
+    Falls back to recipe-level debugsources.list if no ELF binaries found.
     """
     split_root = pkg_info.work_ver / "packages-split"
     pkg_split  = split_root / pkg_info.yocto_pkg
     prefix     = pkg_info.recipe_prefix   # /usr/src/debug/<recipe>/<ver>/
 
-    counts  = {"c": 0, "h": 0, "S": 0, "missing": 0}
+    counts = {
+        "compiled_used": 0,
+        "compiled_not_used": 0,
+        "never_used": 0,
+        "missing": 0,
+    }
     pkg_out = out_dir / pkg_info.installed_name
+
+    # Gather compile-log paths early (used for both categories 2 and 3)
+    compiled_srcs: set[Path] = _get_compiled_srcs(pkg_info.work_ver)
 
     # ── Try DWARF-based per-binary collection ──────────────────────────────
     installed_elfs = yu.find_installed_elfs(pkg_split)
     if installed_elfs:
         dwarf_rels: set[str] = set()
+        src_roots:  set[str] = set()
+
         for elf in installed_elfs:
             dbg = yu.find_debug_counterpart(elf, pkg_split)
             target = dbg if (dbg and dbg.exists()) else elf
@@ -60,20 +133,22 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                     rel = path[len(prefix):]
                     if rel and not rel.startswith("<"):
                         dwarf_rels.add(rel)
+                        parts = Path(rel).parts
+                        if len(parts) > 1:
+                            src_roots.add(parts[0])
 
         if dwarf_rels:
-            # Collect .c / .S from DWARF CU list
+            # ── Category 1: compiled + used (DWARF) ───────────────────────
             for rel in dwarf_rels:
-                src = pkg_info.work_ver / rel
-                ext = Path(rel).suffix.lstrip(".")
-                if copy_source(src, pkg_out / rel):
-                    if ext in counts:
-                        counts[ext] += 1
+                src     = pkg_info.work_ver / rel
+                dst_rel = yu.strip_src_root(rel)
+                if copy_source(src, pkg_out / dst_rel):
+                    counts["compiled_used"] += 1
                 else:
                     counts["missing"] += 1
 
-            # Also collect .h files from debugsources.list (DWARF CU level
-            # only tracks compilation units, not included headers).
+            # Also collect .h files from debugsources.list (DWARF CU only
+            # tracks compilation units, not included headers).
             debugsources = pkg_info.work_ver / "debugsources.list"
             if debugsources.exists():
                 for debug_path in yu.read_debugsources(debugsources):
@@ -84,27 +159,112 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                         continue
                     if not rel.endswith(".h"):
                         continue
-                    src = pkg_info.work_ver / rel
-                    if copy_source(src, pkg_out / rel):
-                        counts["h"] += 1
+                    src     = pkg_info.work_ver / rel
+                    dst_rel = yu.strip_src_root(rel)
+                    if copy_source(src, pkg_out / dst_rel):
+                        counts["compiled_used"] += 1
+
+            # ── Category 2: compiled + not-used (in log, not in DWARF) ────
+            if compiled_srcs:
+                cat2: list[tuple[Path, str]] = []
+                for abs_src in compiled_srcs:
+                    try:
+                        rel = str(abs_src.relative_to(pkg_info.work_ver))
+                    except ValueError:
+                        continue
+                    if rel in dwarf_rels:
+                        continue   # already in category 1
+                    cat2.append((abs_src, yu.strip_src_root(rel)))
+                counts["compiled_not_used"] = _collect_category(
+                    cat2, pkg_out / "_compiled_not_used"
+                )
+
+            # ── Category 3: never compiled (in source tree, not in log) ───
+            if src_roots:
+                dwarf_abs: set[Path] = {pkg_info.work_ver / r for r in dwarf_rels}
+                cat3: list[tuple[Path, str]] = []
+                for root_name in src_roots:
+                    if yu.is_build_dir(root_name):
+                        continue
+                    root_dir = pkg_info.work_ver / root_name
+                    if not root_dir.exists():
+                        continue
+                    for src_file in root_dir.rglob("*"):
+                        if not src_file.is_file():
+                            continue
+                        if src_file in compiled_srcs or src_file in dwarf_abs:
+                            continue
+                        if not _is_collectible(src_file):
+                            continue
+                        rel_full = str(src_file.relative_to(pkg_info.work_ver))
+                        cat3.append((src_file, yu.strip_src_root(rel_full)))
+                counts["never_used"] = _collect_category(
+                    cat3, pkg_out / "_never_used"
+                )
+
             return counts
 
     # ── Fallback: recipe-level debugsources.list ───────────────────────────
     debugsources = pkg_info.work_ver / "debugsources.list"
     paths = yu.read_debugsources(debugsources)
+    src_roots_fb: set[str] = set()
+    fallback_rels: set[str] = set()
+
     for debug_path in paths:
         if not debug_path.startswith(prefix):
             continue
         rel = debug_path[len(prefix):]
         if not rel or rel.startswith("<"):
             continue
-        src = pkg_info.work_ver / rel
-        ext = Path(rel).suffix.lstrip(".")
-        if copy_source(src, pkg_out / rel):
-            if ext in counts:
-                counts[ext] += 1
+        src     = pkg_info.work_ver / rel
+        dst_rel = yu.strip_src_root(rel)
+        if copy_source(src, pkg_out / dst_rel):
+            counts["compiled_used"] += 1
+            fallback_rels.add(rel)
+            parts = Path(rel).parts
+            if len(parts) > 1:
+                src_roots_fb.add(parts[0])
         else:
             counts["missing"] += 1
+
+    # Category 2 for fallback
+    if compiled_srcs:
+        cat2_fb: list[tuple[Path, str]] = []
+        for abs_src in compiled_srcs:
+            try:
+                rel = str(abs_src.relative_to(pkg_info.work_ver))
+            except ValueError:
+                continue
+            if rel in fallback_rels:
+                continue
+            cat2_fb.append((abs_src, yu.strip_src_root(rel)))
+        counts["compiled_not_used"] = _collect_category(
+            cat2_fb, pkg_out / "_compiled_not_used"
+        )
+
+    # Category 3 for fallback
+    if src_roots_fb:
+        dwarf_abs_fb: set[Path] = {pkg_info.work_ver / r for r in fallback_rels}
+        cat3_fb: list[tuple[Path, str]] = []
+        for root_name in src_roots_fb:
+            if yu.is_build_dir(root_name):
+                continue
+            root_dir = pkg_info.work_ver / root_name
+            if not root_dir.exists():
+                continue
+            for src_file in root_dir.rglob("*"):
+                if not src_file.is_file():
+                    continue
+                if src_file in compiled_srcs or src_file in dwarf_abs_fb:
+                    continue
+                if not _is_collectible(src_file):
+                    continue
+                rel_full = str(src_file.relative_to(pkg_info.work_ver))
+                cat3_fb.append((src_file, yu.strip_src_root(rel_full)))
+        counts["never_used"] = _collect_category(
+            cat3_fb, pkg_out / "_never_used"
+        )
+
     return counts
 
 
@@ -141,12 +301,6 @@ def collect_kernel_image(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                 break
 
     # ── Step 2: headers from Kbuild .cmd dependency files ─────────────────
-    # Kbuild writes  build/path/.foo.o.cmd  for each  build/path/foo.o
-    # The file contains the compile command on line 1, then the header deps:
-    #   deps_path/foo.o := \
-    #     /abs/path/header1.h \
-    #     /abs/path/header2.h \
-    # We collect only headers that live under kernel-source/.
     src_prefix = str(k.src_dir)
     collected_h: set[str] = set()
 
@@ -155,7 +309,6 @@ def collect_kernel_image(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
             continue
         if o_file.name.startswith(".") or o_file.name.endswith(".mod.o"):
             continue
-        # .cmd file sits beside the .o with a leading dot
         cmd_file = o_file.parent / f".{o_file.name}.cmd"
         if not cmd_file.exists():
             continue
@@ -216,22 +369,36 @@ def write_no_source(pkg_info: yu.PackageInfo, out_dir: Path) -> None:
 
 # ── Manifest writer ───────────────────────────────────────────────────────────
 
+def _count_files(d: Path, skip_subdirs: set[str] = frozenset()) -> int:
+    if not d.exists():
+        return 0
+    return sum(
+        1 for f in d.rglob("*")
+        if f.is_file() and (not skip_subdirs or
+           f.relative_to(d).parts[0] not in skip_subdirs)
+    )
+
+
 def write_manifest(packages: list[yu.PackageInfo], out_dir: Path) -> None:
+    _SKIP = {"_compiled_not_used", "_never_used"}
     rows = []
     for p in sorted(packages, key=lambda x: x.installed_name):
         d = out_dir / p.installed_name
-        c = sum(1 for f in d.rglob("*.c")) if d.exists() else 0
-        h = sum(1 for f in d.rglob("*.h")) if d.exists() else 0
-        s = sum(1 for f in d.rglob("*.S")) if d.exists() else 0
-        rows.append((p.installed_name, p.recipe, p.ver, c, h, s, str(d)))
+        cu  = _count_files(d, _SKIP)
+        cnu = _count_files(d / "_compiled_not_used")
+        nu  = _count_files(d / "_never_used")
+        rows.append((p.installed_name, p.recipe, p.ver, cu, cnu, nu, str(d)))
 
     manifest = out_dir / "MANIFEST.txt"
     header = (f"{'package':<55} {'recipe':<20} {'version':<45}"
-              f" {'c':>8} {'h':>8} {'S':>8}  source_dir\n")
-    sep = "-" * 160 + "\n"
+              f" {'compiled+used':>13} {'comp+not-used':>13} {'never-used':>10}  source_dir\n")
+    sep = "-" * 175 + "\n"
     lines = [header, sep]
-    for name, rec, ver, c, h, s, sdir in rows:
-        lines.append(f"{name:<55} {rec:<20} {ver:<45} {c:>8} {h:>8} {s:>8}  {sdir}\n")
+    for name, rec, ver, cu, cnu, nu, sdir in rows:
+        lines.append(
+            f"{name:<55} {rec:<20} {ver:<45}"
+            f" {cu:>13} {cnu:>13} {nu:>10}  {sdir}\n"
+        )
     manifest.write_text("".join(lines))
     print(f"\nManifest: {manifest}")
 
@@ -240,7 +407,7 @@ def write_manifest(packages: list[yu.PackageInfo], out_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect compiled sources per installed Yocto package.",
+        description="Collect sources per installed Yocto package (3 categories).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Usage:")[1].strip() if "Usage:" in __doc__ else "",
     )
@@ -276,8 +443,7 @@ def main():
     packages = yu.discover_packages(manifest_path, build_dir, machine, args.verbose)
     print(f"\nDiscovered {len(packages)} packages\n")
 
-    # Track which kernel-image collection has been done (image pkgs share sources)
-    kernel_image_done: dict[tuple[str, str], bool] = {}  # (recipe, ver) -> done
+    kernel_image_done: dict[tuple[str, str], bool] = {}
 
     for pkg in packages:
         print(f"[{pkg.installed_name}]  type={pkg.pkg_type}  recipe={pkg.recipe}  ver={pkg.ver}")
@@ -294,10 +460,8 @@ def main():
                 kernel_image_done[key] = True
                 print(f"  → c={counts['c']}  h={counts['h']}  S={counts['S']}  missing={counts['missing']}")
             else:
-                # Sibling image package — note it shares sources
                 note_dir = out_dir / pkg.installed_name
                 note_dir.mkdir(parents=True, exist_ok=True)
-                # Find the primary package name for this kernel/ver
                 primary = next(
                     (p.installed_name for p in packages
                      if p.pkg_type == "kernel_image"
@@ -319,7 +483,10 @@ def main():
 
         # userspace
         counts = collect_userspace(pkg, out_dir)
-        print(f"  → c={counts['c']}  h={counts['h']}  S={counts['S']}  missing={counts['missing']}")
+        print(f"  → compiled+used={counts['compiled_used']}  "
+              f"compiled+not-used={counts['compiled_not_used']}  "
+              f"never-used={counts['never_used']}  "
+              f"missing={counts['missing']}")
 
     write_manifest(packages, out_dir)
     pkg_dirs = len([d for d in out_dir.iterdir() if d.is_dir()])

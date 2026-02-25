@@ -203,10 +203,12 @@ def check_coverage(
                 outside.append(str(cmd.src))
             continue
 
-        if (pkg_sources / rel).exists():
-            covered.append(str(rel))
+        # Collected files are stored with source-root prefix stripped.
+        stripped = yu.strip_src_root(str(rel))
+        if (pkg_sources / stripped).exists():
+            covered.append(stripped)
         else:
-            not_coll.append(str(rel))
+            not_coll.append(stripped)
 
     total = len(cmds)
     return {
@@ -345,7 +347,7 @@ def compile_test(
         tmp_path = Path(tmp)
 
         for idx, cmd in enumerate(cmds):
-            # Resolve collected source
+            # Resolve collected source (files are stored with source-root stripped)
             try:
                 rel = cmd.src.relative_to(pkg.work_ver)
             except ValueError:
@@ -354,7 +356,7 @@ def compile_test(
                     results["skip"] += 1
                 continue
 
-            collected_src = pkg_sources / rel
+            collected_src = pkg_sources / yu.strip_src_root(str(rel))
             if not collected_src.exists():
                 results["skip"] += 1
                 continue
