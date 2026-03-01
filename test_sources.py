@@ -103,6 +103,9 @@ def parse_compile_log(log_file: Path, initial_cwd: Path) -> list[CompileCmd]:
                 current_depth = max(remaining) if remaining else 0
             continue
 
+        # Strip ninja/meson progress prefix: [N/M]
+        line = re.sub(r'^\[\d+/\d+\]\s+', '', line)
+
         # Require -c flag and a compiler invocation
         if " -c " not in line or not _COMPILER_RE.search(line):
             continue
@@ -110,10 +113,16 @@ def parse_compile_log(log_file: Path, initial_cwd: Path) -> list[CompileCmd]:
         # as "libtool: compile:  gcc ..." which we'll pick up separately.
         if "--mode=compile" in line:
             continue
-        # Strip "libtool: compile:  " prefix emitted by libtool for the
-        # actual gcc invocation so the command parses correctly.
-        if line.startswith("libtool: compile:"):
-            line = line[len("libtool: compile:"):].lstrip()
+        # Strip libtool compile prefix emitted for the actual gcc
+        # invocation. Handles both native ("libtool: compile:") and
+        # cross-prefixed ("aarch64-poky-linux-libtool: compile:").
+        m_lt = re.match(r'^\S*libtool:\s+compile:\s+', line)
+        if m_lt:
+            line = line[m_lt.end():]
+        # Strip trailing shell redirections (>/dev/null 2>&1, etc.)
+        # shlex.split treats these as regular tokens, causing gcc to
+        # interpret >/dev/null as a filename argument.
+        line = re.sub(r'(?:\s+[12]?>\s*/dev/null|\s+2>&1)+\s*$', '', line)
 
         cwd = cwd_stack.get(current_depth, initial_cwd)
         cmd = _parse_one_cmd(line, cwd)
