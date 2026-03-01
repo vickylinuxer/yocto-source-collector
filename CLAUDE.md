@@ -72,12 +72,16 @@ The compile test replays original gcc commands with the collected source copy vi
 
 - **Ninja/meson progress prefix**: Meson/ninja builds prefix compile lines with `[N/M]` (e.g. `[1/88] gcc ...`). `parse_compile_log` strips this prefix before parsing so it doesn't leak into the replayed command.
 
-- **Cross-libtool prefix**: Libtool emits the actual gcc command as `<cross-prefix>libtool: compile:  gcc ...`. The cross-prefixed variant (e.g. `aarch64-poky-linux-libtool: compile:`) is matched by `^\S*libtool:\s+compile:\s+` and stripped. The wrapper invocation (`--mode=compile`) is skipped entirely.
+- **Cross-libtool prefix**: Libtool emits the actual gcc command as `<cross-prefix>libtool: compile:  gcc ...`. The cross-prefixed variant (e.g. `aarch64-poky-linux-libtool: compile:`) is matched by `\S*libtool:\s+compile:\s+` (searched anywhere in the line, not just at the start) and stripped. This handles cases where text precedes the libtool prefix (e.g. `Confirm gpg-error-config works...libtool: compile:`). The wrapper invocation (`--mode=compile`) is skipped entirely.
 
-- **Shell redirections**: Some commands end with `>/dev/null 2>&1` (e.g. sudo). These are stripped before `shlex.split` tokenization, which would otherwise treat them as filename arguments to gcc.
+- **Shell operators**: Trailing `|| ( ... )` error-handling (bash), `&& true`/`&& :` chaining (nettle), and `>/dev/null 2>&1` redirections (sudo) are all stripped before tokenization.
 
-- **Backtick VPATH expansion**: Some build systems (e.g. util-linux) use `` `test -f 'src.c' || echo '../pkg-ver/'`src.c `` in commands. `shlex.split` breaks these into orphan tokens. `_make_shadow_cmd` strips the entire backtick span and appends the collected source explicitly.
+- **Bare-quoted -D values**: The compile log shows post-shell-expansion text, so `-DNAME="value"` loses its quotes when replayed via `shell=True`. `_make_shadow_cmd` wraps bare-quoted -D values in single quotes: `-DNAME='"value"'` so the shell passes them intact to GCC. Already-single-quoted values (e.g. `-DPROGRAM='"bash"'`) are left untouched.
 
-- **Data-include symlinks**: Collected headers may `#include "file.def"` or `#include "file.tbl"` — non-header files that aren't collected. Before running compile tests, the code symlinks missing `.def`/`.tbl` files from the original tree into the collected directories (and cleans them up after). This avoids `-iquote` manipulation which risks shadowing configured headers.
+- **Backtick VPATH expansion**: Some build systems (e.g. util-linux) use `` `test -f 'src.c' || echo '../pkg-ver/'`src.c `` in commands. `_make_shadow_cmd` strips backtick spans via regex and appends the collected source explicitly.
+
+- **Include symlinks**: Collected source/header files may `#include "file.h"`, `#include "file.def"`, or `#include "file.tbl"` — files that aren't collected. Before running compile tests, the code symlinks missing `.h`/`.def`/`.tbl` files from the original tree into collected directories (and cleans them up after). Both the source tree and build tree are scanned for original files, since out-of-tree builds may reference headers from either location.
 
 - **Ancestor `-iquote` paths**: `_make_shadow_cmd` adds `-iquote` for the original source file's parent directory and its ancestors up to `work_ver`, so `#include "..."` from the collected copy resolves headers in the original tree.
+
+- **PATH fallback for Python do_compile**: Some recipes (e.g. psplash) use a Python `do_compile` function instead of a shell script. `_get_build_env` falls back to `run.oe_runmake.*` files to find the cross-compiler PATH when `run.do_compile` doesn't contain shell exports.

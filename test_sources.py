@@ -116,9 +116,16 @@ def parse_compile_log(log_file: Path, initial_cwd: Path) -> list[CompileCmd]:
         # Strip libtool compile prefix emitted for the actual gcc
         # invocation. Handles both native ("libtool: compile:") and
         # cross-prefixed ("aarch64-poky-linux-libtool: compile:").
-        m_lt = re.match(r'^\S*libtool:\s+compile:\s+', line)
+        # Search anywhere in the line — some logs print text before the
+        # libtool prefix (e.g. "Confirm gpg-error-config works...libtool:").
+        m_lt = re.search(r'\S*libtool:\s+compile:\s+', line)
         if m_lt:
             line = line[m_lt.end():]
+        # Strip trailing shell operators that contaminate the gcc command:
+        #   || ( rm -f trap.c ; exit 1 )  — error-handling suffix (bash)
+        #   && true / && :                — shell chaining (nettle)
+        line = re.sub(r'\s*\|\|\s*\(.*\)\s*$', '', line)
+        line = re.sub(r'\s*&&\s*(true|:)\s*$', '', line)
         # Strip trailing shell redirections (>/dev/null 2>&1, etc.)
         # shlex.split treats these as regular tokens, causing gcc to
         # interpret >/dev/null as a filename argument.
@@ -244,57 +251,49 @@ def _make_shadow_cmd(
         transitive #include "..." from collected headers can find sibling
         files in the original source tree
     All other flags (sysroot, -I, -D, etc.) are kept verbatim.
+    Works on the raw command string (no shlex roundtrip) to preserve
+    embedded quoting in -D flags like -DMODULE_NAME="sqlite3".
     Command still runs with cwd = cmd.cwd.
     """
-    try:
-        tokens = shlex.split(cmd.cmd)
-    except ValueError:
-        return cmd.cmd
+    line = cmd.cmd.strip()
 
-    # Pre-filter: remove backtick shell-expansion spans.
-    # These are VPATH-style constructs like:
-    #   `test -f 'lib/strutils.c' || echo '../util-linux-2.37.4/'`lib/strutils.c
-    # shlex.split breaks them into multiple tokens containing backticks
-    # plus orphan tokens (e.g. "-f", "'lib/strutils.c'") between them.
-    # We strip everything from the first backtick token through the last
-    # backtick token (inclusive); the resolved source path is already known.
-    filtered: list[str] = []
-    first_bt = last_bt = -1
-    for j, t in enumerate(tokens):
-        if "`" in t:
-            if first_bt < 0:
-                first_bt = j
-            last_bt = j
-    if first_bt >= 0:
-        filtered = tokens[:first_bt] + tokens[last_bt + 1:]
-    else:
-        filtered = tokens
+    # Fix bare-quoted -D values: the compile log may show -DNAME="value"
+    # where the original command had -DNAME='"value"' or -DNAME=\"value\".
+    # When replayed with shell=True, the bare quotes get stripped.  Wrap
+    # such values in single quotes so the shell passes them intact to GCC.
+    # Only fix bare-quoted values (not already single-quote-wrapped).
+    line = re.sub(
+        r'-D(\w+=)"([^"]*)"(?=\s|$)',
+        lambda m: f'''-D{m.group(1)}\'"{m.group(2)}"\'''',
+        line,
+    )
 
-    new_tokens: list[str] = []
-    src_done = obj_done = False
-    i = 0
-    while i < len(filtered):
-        if filtered[i] == "-o" and i + 1 < len(filtered) and not obj_done:
-            new_tokens += ["-o", str(out_obj)]
-            obj_done = True
-            i += 2
-        elif (not filtered[i].startswith("-") and not src_done
-              and any(filtered[i].endswith(e) for e in _SOURCE_EXTS)):
-            new_tokens.append(str(collected_src))
-            src_done = True
-            i += 1
-        else:
-            new_tokens.append(filtered[i])
-            i += 1
+    # Strip backtick shell-expansion spans (VPATH-style constructs).
+    # e.g. `test -f 'lib/strutils.c' || echo '../util-linux-2.37.4/'`lib/strutils.c
+    has_backtick = "`" in line
+    if has_backtick:
+        line = re.sub(r'`[^`]*`\S*', '', line)
 
-    # If no source file token was found (e.g. stripped with backtick span),
-    # append the collected source explicitly.
-    if not src_done:
-        new_tokens.append(str(collected_src))
+    # Replace -o argument in the raw string.
+    line = re.sub(r'-o\s+\S+', f'-o {shlex.quote(str(out_obj))}', line, count=1)
 
-    # If no -o was found, append it
-    if not obj_done:
-        new_tokens += ["-o", str(out_obj)]
+    # Find and replace the source file argument.
+    # Match the last non-flag token with a source extension.
+    src_replaced = False
+    src_pat = r'(?:^|\s)(?!-)(\S+(?:' + '|'.join(re.escape(e) for e in _SOURCE_EXTS) + r'))(?=\s|$)'
+    matches = list(re.finditer(src_pat, line))
+    if matches:
+        m = matches[-1]
+        line = line[:m.start(1)] + shlex.quote(str(collected_src)) + line[m.end(1):]
+        src_replaced = True
+
+    # If no source was found (e.g. stripped with backtick span), append it.
+    if not src_replaced:
+        line += ' ' + shlex.quote(str(collected_src))
+
+    # If no -o was in the original command, append it.
+    if '-o ' not in cmd.cmd:
+        line += f' -o {shlex.quote(str(out_obj))}'
 
     # Add the original source directory and its ancestor directories (up to
     # work_ver) as quoted include search paths.  This ensures:
@@ -306,7 +305,7 @@ def _make_shadow_cmd(
     # Using -iquote (not -I) keeps system '#include <...>' lookups unaffected,
     # preventing project-local files from shadowing system headers.
     orig_src_dir = cmd.src.parent
-    new_tokens.append(f"-iquote{orig_src_dir}")
+    line += f' -iquote{orig_src_dir}'
 
     # Walk ancestor directories from orig_src_dir up to (but not including)
     # work_ver, adding each as -iquote so transitive includes resolve.
@@ -314,29 +313,36 @@ def _make_shadow_cmd(
         d = orig_src_dir.parent
         try:
             while d != work_ver and d.is_relative_to(work_ver):
-                new_tokens.append(f"-iquote{d}")
+                line += f' -iquote{d}'
                 d = d.parent
         except (ValueError, OSError):
             pass
 
-    return shlex.join(new_tokens)
+    return line
 
 
 def _get_build_env(work_ver: Path) -> dict:
     """
     Read the PATH and essential environment variables from run.do_compile
     so that the cross-compiler and build tools can be found.
+    Falls back to run.oe_runmake.* when run.do_compile is a Python script
+    (e.g. psplash) that doesn't export PATH directly.
     Returns a modified copy of os.environ.
     """
     env = os.environ.copy()
-    run_script = work_ver / "temp" / "run.do_compile"
-    if not run_script.exists():
-        return env
-    for line in run_script.read_text(errors="replace").splitlines():
-        m = re.match(r"^export (\w+)=\"(.*)\"$", line)
-        if m and m.group(1) == "PATH":
-            env["PATH"] = m.group(2)
-            break
+    # Try run.do_compile first, then fall back to run.oe_runmake.*
+    candidates = [work_ver / "temp" / "run.do_compile"]
+    temp_dir = work_ver / "temp"
+    if temp_dir.is_dir():
+        candidates += sorted(temp_dir.glob("run.oe_runmake.*"), reverse=True)
+    for run_script in candidates:
+        if not run_script.exists():
+            continue
+        for line in run_script.read_text(errors="replace").splitlines():
+            m = re.match(r'^export (\w+)="(.*)"$', line)
+            if m and m.group(1) == "PATH":
+                env["PATH"] = m.group(2)
+                return env
     return env
 
 
@@ -383,36 +389,46 @@ def compile_test(
 
     build_env = _get_build_env(pkg.work_ver)
 
-    # Symlink missing data-include files (.def, .tbl) into the collected
-    # tree.  Collected headers may #include "categories.def" etc., and GCC
-    # looks in the including file's directory first.  Without the symlinks,
-    # GCC finds the collected .h but not its sibling .def/.tbl file.
+    # Symlink missing include files into the collected tree so that
+    # transitively-included headers can find siblings in the original tree.
+    # Covers .def/.tbl data-includes and .h headers not collected by DWARF.
     # Using symlinks avoids -iquote manipulation that can shadow headers.
-    _INCLUDE_DATA_EXTS = {".def", ".tbl"}
+    _INCLUDE_EXTS = {".def", ".tbl", ".h"}
     _data_symlinks: list[Path] = []
     try:
-        for first_cmd in cmds:
+        # Collect all source-root directories: both the recipe source dir
+        # (e.g. bash-5.0/) and build dir (build/) since out-of-tree builds
+        # may reference headers from either.
+        src_roots: list[Path] = []
+        for c in cmds:
             try:
-                first_rel = first_cmd.src.relative_to(pkg.work_ver)
-                src_root = pkg.work_ver / first_rel.parts[0]
-                for dirpath, _dirs, files in os.walk(pkg_sources):
-                    if not any(f.endswith(".h") for f in files):
-                        continue
-                    reldir = Path(dirpath).relative_to(pkg_sources)
-                    orig_dir = src_root / reldir
-                    if not orig_dir.is_dir():
-                        continue
-                    collected_dir = Path(dirpath)
-                    for f in orig_dir.iterdir():
-                        if (f.is_file()
-                                and f.suffix in _INCLUDE_DATA_EXTS
-                                and not (collected_dir / f.name).exists()):
-                            link = collected_dir / f.name
-                            link.symlink_to(f)
-                            _data_symlinks.append(link)
-                break
+                rel = c.src.relative_to(pkg.work_ver)
+                root = pkg.work_ver / rel.parts[0]
+                if root not in src_roots and root.is_dir():
+                    src_roots.append(root)
             except (ValueError, IndexError):
                 continue
+            if len(src_roots) >= 3:
+                break
+        for dirpath, _dirs, files in os.walk(pkg_sources):
+            # Symlink into any collected directory with source or
+            # header files, so transitive includes can resolve.
+            if not any(f.endswith((".c", ".h", ".S", ".cc", ".cpp"))
+                       for f in files):
+                continue
+            reldir = Path(dirpath).relative_to(pkg_sources)
+            collected_dir = Path(dirpath)
+            for src_root in src_roots:
+                orig_dir = src_root / reldir
+                if not orig_dir.is_dir():
+                    continue
+                for f in orig_dir.iterdir():
+                    if (f.is_file()
+                            and f.suffix in _INCLUDE_EXTS
+                            and not (collected_dir / f.name).exists()):
+                        link = collected_dir / f.name
+                        link.symlink_to(f)
+                        _data_symlinks.append(link)
     except OSError:
         pass
 
