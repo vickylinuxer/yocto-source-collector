@@ -34,6 +34,8 @@ def copy_source(src: Path, dst: Path) -> bool:
     if not src.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.chmod(0o644)
     shutil.copy2(src, dst)
     return True
 

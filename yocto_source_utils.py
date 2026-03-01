@@ -125,8 +125,11 @@ def find_manifest(build_dir: Path, image_or_path: str) -> Path:
 
 def build_pkgname_map(pkgdata_runtime: Path) -> dict[str, str]:
     """
-    Return {installed_pkg_name: yocto_packages_split_dir} by scanning
-    PKG:<yocto_pkg>: <installed_name> entries in pkgdata runtime files.
+    Return {installed_pkg_name: yocto_pkg_name} by scanning
+    PKG_<yocto_pkg>: <installed_name> entries in pkgdata runtime files.
+
+    Yocto pkgdata format:  PKG_<yocto>: <installed>
+    Example:               PKG_glibc: libc6
     """
     mapping: dict[str, str] = {}
     if not pkgdata_runtime.exists():
@@ -136,11 +139,14 @@ def build_pkgname_map(pkgdata_runtime: Path) -> dict[str, str]:
             continue
         try:
             for line in f.read_text(errors="replace").splitlines():
-                if line.startswith("PKG:"):
-                    parts = line.split(":", 2)
-                    if len(parts) == 3:
-                        yocto_pkg      = parts[1].strip()
-                        installed_name = parts[2].strip()
+                if line.startswith("PKG_"):
+                    # PKG_<yocto_pkg>: <installed_name>
+                    key, _, installed_name = line.partition(":")
+                    if not installed_name:
+                        continue
+                    yocto_pkg = key[4:]          # strip "PKG_"
+                    installed_name = installed_name.strip()
+                    if installed_name and installed_name != yocto_pkg:
                         mapping[installed_name] = yocto_pkg
         except OSError:
             pass
@@ -409,7 +415,11 @@ def discover_packages(
         recipe = data.get("PN", yocto_pkg)
         pv     = data.get("PV", "")
         pr     = data.get("PR", "r0")
-        ver    = f"{pv}-{pr}" if pv else "unknown"
+        pe     = data.get("PE", "")
+        if pv:
+            ver = f"{pe}_{pv}-{pr}" if pe else f"{pv}-{pr}"
+        else:
+            ver = "unknown"
 
         # ── Find work dir ─────────────────────────────────────────────────────
         cache_key = (recipe, ver)
