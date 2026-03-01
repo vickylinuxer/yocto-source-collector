@@ -70,6 +70,12 @@ Uses DWARF per-binary collection for userspace; `.o`-based collection for kernel
 
 The compile test replays original gcc commands with the collected source copy via `_make_shadow_cmd`. Key subtleties:
 
+- **Ninja/meson progress prefix**: Meson/ninja builds prefix compile lines with `[N/M]` (e.g. `[1/88] gcc ...`). `parse_compile_log` strips this prefix before parsing so it doesn't leak into the replayed command.
+
+- **Cross-libtool prefix**: Libtool emits the actual gcc command as `<cross-prefix>libtool: compile:  gcc ...`. The cross-prefixed variant (e.g. `aarch64-poky-linux-libtool: compile:`) is matched by `^\S*libtool:\s+compile:\s+` and stripped. The wrapper invocation (`--mode=compile`) is skipped entirely.
+
+- **Shell redirections**: Some commands end with `>/dev/null 2>&1` (e.g. sudo). These are stripped before `shlex.split` tokenization, which would otherwise treat them as filename arguments to gcc.
+
 - **Backtick VPATH expansion**: Some build systems (e.g. util-linux) use `` `test -f 'src.c' || echo '../pkg-ver/'`src.c `` in commands. `shlex.split` breaks these into orphan tokens. `_make_shadow_cmd` strips the entire backtick span and appends the collected source explicitly.
 
 - **Data-include symlinks**: Collected headers may `#include "file.def"` or `#include "file.tbl"` — non-header files that aren't collected. Before running compile tests, the code symlinks missing `.def`/`.tbl` files from the original tree into the collected directories (and cleans them up after). This avoids `-iquote` manipulation which risks shadowing configured headers.
