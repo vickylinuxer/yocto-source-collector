@@ -63,10 +63,18 @@ All output goes to `./output/` relative to the current directory:
         busybox/       # DWARF-confirmed source files
         glibc/
         ...
+    licenses/          # license text files per recipe (deduplicated)
+        busybox/       # LICENSE.0, generic_GPLv2, ...
+        glibc/         # COPYING, COPYING.LIB, ...
+    patches/           # applied patches per recipe (deduplicated)
+        busybox/       # *.patch files from work dir
+        glibc/
+        ...
     report.html        # interactive HTML report
 ```
 
 Packages with no compiled source (scripts, configs, data) have an empty directory.
+License and patch files are collected once per recipe (shared across all sub-packages from the same recipe).
 
 ## How it works
 
@@ -88,9 +96,34 @@ Parses `temp/log.do_compile` to extract every `gcc -c` invocation, then:
 1. **Coverage check**: reports which compiled sources are present in the collected directory.
 2. **Compile test** (`--compile`): re-runs each compile command with the collected source copy and verifies it succeeds.
 
+### License and patch collection
+
+During `collect` (and `all`), the tool also gathers:
+
+- **License texts** from `tmp/deploy/licenses/{recipe}/` (excluding the `recipeinfo` metadata file)
+- **Patches** (`.patch` and `.diff` files) from the top level of each recipe's work directory
+
+These are deduplicated per recipe — if multiple packages come from the same recipe (e.g. `libglib-2.0-0` and `glib-2.0-utils` both from `glib-2.0`), license and patch files are collected only once.
+
+### Linking analysis
+
+The report includes shared library dependency analysis for each package:
+
+- Runs `readelf -d` on installed ELF binaries to extract `NEEDED` shared libraries
+- Resolves each library to its provider package/recipe via Yocto's `shlibs2` database
+- Looks up the provider's license and flags copyleft dependencies
+- Highlights copyleft linking chains (e.g. a permissively-licensed package linking against a GPL library)
+
 ### HTML report
 
-Generates a self-contained interactive HTML report (Chart.js) showing per-package source file counts, installed file counts, file-type breakdowns, and DWARF cross-check results. Supports filtering and sorting.
+Generates a self-contained interactive HTML report (Chart.js) with:
+
+- **Summary cards**: package count, source files, installed files, copyleft package count, patch count
+- **Per-package table**: sortable columns including license (with copyleft badge)
+- **6 detail tabs per package**: Source Files, Installed Files, License, Patches, Metadata, Dependencies
+- **Dependency tab**: shows NEEDED libraries, provider recipes, licenses, and copyleft warnings
+
+Supports filtering by package name and type.
 
 ## Notes
 

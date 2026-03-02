@@ -61,6 +61,12 @@ TYPE_COLOR = {
     "no_source":     "#b0b0b0",
 }
 
+_COPYLEFT_KEYWORDS = {"GPL", "LGPL", "AGPL", "EUPL", "MPL", "CDDL", "OSL"}
+
+
+def is_copyleft(license_str: str) -> bool:
+    upper = license_str.upper()
+    return any(kw in upper for kw in _COPYLEFT_KEYWORDS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -569,6 +575,132 @@ def get_installed_files(pkgdata_runtime: Path, yocto_pkg: str,
     return result
 
 
+def get_license_files(build_dir: Path, recipe: str) -> list[Path]:
+    lic_dir = build_dir / "tmp" / "deploy" / "licenses" / recipe
+    if not lic_dir.exists():
+        return []
+    return [f for f in sorted(lic_dir.iterdir())
+            if f.is_file() and f.name != "recipeinfo"]
+
+
+def get_patch_files(work_ver: Path) -> list[Path]:
+    if not work_ver or not work_ver.exists():
+        return []
+    return sorted(
+        f for f in work_ver.iterdir()
+        if f.is_file() and (f.suffix == ".patch" or f.suffix == ".diff")
+    )
+
+
+def get_pkg_metadata(pkgdata_runtime: Path, yocto_pkg: str) -> dict:
+    pkgdata_file = pkgdata_runtime / yocto_pkg
+    if not pkgdata_file.exists():
+        return {}
+    data = parse_pkgdata_file(pkgdata_file)
+    result: dict = {}
+    for key in ("LICENSE", "HOMEPAGE", "DESCRIPTION", "SUMMARY", "SECTION"):
+        if key in data:
+            result[key.lower()] = data[key]
+    rdep_key = f"RDEPENDS_{yocto_pkg}"
+    if rdep_key in data:
+        result["rdepends"] = data[rdep_key]
+    elif "RDEPENDS" in data:
+        result["rdepends"] = data["RDEPENDS"]
+    return result
+
+
+def build_shlibs_map(build_dir: Path, machine: str) -> dict[str, str]:
+    shlibs_dir = build_dir / "tmp" / "pkgdata" / machine / "shlibs2"
+    mapping: dict[str, str] = {}
+    if not shlibs_dir.exists():
+        return mapping
+    for list_file in shlibs_dir.iterdir():
+        if not list_file.is_file():
+            continue
+        provider_pkg = list_file.stem
+        try:
+            for line in list_file.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(":")
+                if parts:
+                    soname = parts[0].strip()
+                    if soname:
+                        mapping[soname] = provider_pkg
+        except OSError:
+            pass
+    return mapping
+
+
+def get_needed_libs(elf_path: Path) -> list[str]:
+    try:
+        r = subprocess.run(
+            ["readelf", "-d", str(elf_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return []
+    needed: list[str] = []
+    for line in r.stdout.splitlines():
+        if "(NEEDED)" in line:
+            m = re.search(r'\[(.+?)\]', line)
+            if m:
+                needed.append(m.group(1))
+    return needed
+
+
+def resolve_linking_deps(
+    installed_files: list[dict],
+    pkg_split: Path | None,
+    shlibs_map: dict[str, str],
+    pkgdata_runtime: Path,
+    license_cache: dict[str, str],
+) -> dict:
+    needed_libs: list[dict] = []
+    seen_libs: set[str] = set()
+    linking_chain: dict[str, str] = {}
+
+    if not pkg_split or not pkg_split.exists():
+        return {"needed_libs": needed_libs, "linking_chain": linking_chain}
+
+    for f in installed_files:
+        if not f["is_elf"]:
+            continue
+        elf_path = pkg_split / f["path"].lstrip("/")
+        if not elf_path.exists() or elf_path.is_symlink():
+            continue
+        for lib in get_needed_libs(elf_path):
+            if lib in seen_libs:
+                continue
+            seen_libs.add(lib)
+            provider_pkg = shlibs_map.get(lib, "")
+            provider_recipe = ""
+            provider_license = ""
+            copyleft = False
+            if provider_pkg:
+                if provider_pkg not in license_cache:
+                    meta = get_pkg_metadata(pkgdata_runtime, provider_pkg)
+                    license_cache[provider_pkg] = meta.get("license", "")
+                provider_license = license_cache.get(provider_pkg, "")
+                pdata = pkgdata_runtime / provider_pkg
+                if pdata.exists():
+                    d = parse_pkgdata_file(pdata)
+                    provider_recipe = d.get("PN", provider_pkg)
+                copyleft = is_copyleft(provider_license) if provider_license else False
+                if provider_recipe and provider_license:
+                    linking_chain[provider_recipe] = provider_license
+            needed_libs.append({
+                "lib": lib,
+                "provider_pkg": provider_pkg,
+                "provider_recipe": provider_recipe,
+                "provider_license": provider_license,
+                "copyleft": copyleft,
+            })
+
+    return {"needed_libs": needed_libs, "linking_chain": linking_chain}
+
+
 # ── Shared argparse helpers ─────────────────────────────────────────────────
 
 def add_common_args(parser) -> None:
@@ -1044,14 +1176,18 @@ class Collector:
         self.session = session
         self.clean = clean
         self.out_dir = session.sources_dir
+        self.licenses_dir = session.output_dir / "licenses"
+        self.patches_dir = session.output_dir / "patches"
 
     def run(self) -> None:
         session = self.session
         session.print_header()
 
-        if self.clean and self.out_dir.exists():
-            shutil.rmtree(self.out_dir)
-            print("(cleaned output dir)")
+        if self.clean:
+            for d in (self.out_dir, self.licenses_dir, self.patches_dir):
+                if d.exists():
+                    shutil.rmtree(d)
+            print("(cleaned output dirs)")
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1059,6 +1195,9 @@ class Collector:
         print(f"\nDiscovered {len(packages)} packages\n")
 
         kernel_image_done: dict[tuple[str, str], bool] = {}
+        recipes_done: set[str] = set()
+        total_lic = 0
+        total_pat = 0
 
         for pkg in packages:
             print(f"[{pkg.installed_name}]  type={pkg.pkg_type}  recipe={pkg.recipe}  ver={pkg.ver}")
@@ -1066,9 +1205,7 @@ class Collector:
             if pkg.pkg_type == "no_source":
                 self.write_no_source(pkg)
                 print("  → (no compiled source)")
-                continue
-
-            if pkg.pkg_type == "kernel_image":
+            elif pkg.pkg_type == "kernel_image":
                 key = (pkg.recipe, pkg.ver)
                 if not kernel_image_done.get(key):
                     counts = self.collect_kernel_image(pkg)
@@ -1089,19 +1226,56 @@ class Collector:
                         f"See that directory for the full source list.\n"
                     )
                     print(f"  → shares sources with {primary}")
-                continue
-
-            if pkg.pkg_type == "kernel_module":
+            elif pkg.pkg_type == "kernel_module":
                 counts = self.collect_kernel_module(pkg)
                 print(f"  → c={counts['c']}  h={counts.get('h', 0)}  S={counts['S']}  missing={counts['missing']}")
-                continue
+            else:
+                counts = self.collect_userspace(pkg)
+                print(f"  → sources={counts['compiled_used']}  missing={counts['missing']}")
 
-            counts = self.collect_userspace(pkg)
-            print(f"  → sources={counts['compiled_used']}  missing={counts['missing']}")
+            # Collect licenses and patches per recipe (deduplicated)
+            if pkg.recipe not in recipes_done:
+                recipes_done.add(pkg.recipe)
+                n_lic = self.collect_licenses(pkg.recipe, session.build_dir)
+                n_pat = self.collect_patches(pkg.recipe, pkg.work_ver)
+                total_lic += n_lic
+                total_pat += n_pat
+                if n_lic or n_pat:
+                    print(f"  → licenses={n_lic}  patches={n_pat}")
 
         self.write_manifest(packages)
         pkg_dirs = len([d for d in self.out_dir.iterdir() if d.is_dir()])
         print(f"Done. {pkg_dirs} package directories in {self.out_dir}")
+        print(f"  Licenses: {total_lic} files in {self.licenses_dir}")
+        print(f"  Patches:  {total_pat} files in {self.patches_dir}")
+
+    def collect_licenses(self, recipe: str, build_dir: Path) -> int:
+        files = get_license_files(build_dir, recipe)
+        if not files:
+            return 0
+        dest = self.licenses_dir / recipe
+        dest.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for f in files:
+            dst = dest / f.name
+            if not dst.exists():
+                shutil.copy2(f, dst)
+                count += 1
+        return count
+
+    def collect_patches(self, recipe: str, work_ver: Path | None) -> int:
+        files = get_patch_files(work_ver)
+        if not files:
+            return 0
+        dest = self.patches_dir / recipe
+        dest.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for f in files:
+            dst = dest / f.name
+            if not dst.exists():
+                shutil.copy2(f, dst)
+                count += 1
+        return count
 
     def collect_userspace(self, pkg_info: PackageInfo) -> dict:
         build_dir = self.session.build_dir
@@ -1690,6 +1864,8 @@ tr.detail-row td{{padding:0;border-top:none}}
   <div class="card c4"><div class="val">{total_pkgs}</div><div class="lbl">Installed packages</div></div>
   <div class="card c3"><div class="val">{total_cu}</div><div class="lbl">Source files</div></div>
   <div class="card" style="border-left:3px solid #2980b9"><div class="val" style="color:#2980b9">{total_installed}</div><div class="lbl">Installed files</div></div>
+  <div class="card" style="border-left:3px solid #e74c3c"><div class="val" style="color:#e74c3c">{total_copyleft}</div><div class="lbl">Copyleft packages</div></div>
+  <div class="card" style="border-left:3px solid #8e44ad"><div class="val" style="color:#8e44ad">{total_patches}</div><div class="lbl">Patches</div></div>
 </div>
 
 <!-- Charts -->
@@ -1722,6 +1898,7 @@ tr.detail-row td{{padding:0;border-top:none}}
       <th data-col="name">Package <span class="si">↕</span></th>
       <th data-col="recipe">Recipe <span class="si">↕</span></th>
       <th data-col="type_label">Type <span class="si">↕</span></th>
+      <th data-col="license">License <span class="si">↕</span></th>
       <th data-col="cu_total" style="text-align:right">Source Files <span class="si">↕</span></th>
       <th data-col="installed_total" style="text-align:right">Installed <span class="si">↕</span></th>
     </tr></thead>
@@ -1902,6 +2079,95 @@ function installedPane(id, files, total, elfCount, binarySources, active){{
   </div>`;
 }}
 
+function licensePane(id, d, active){{
+  if(!d.license && (!d.license_files||!d.license_files.length))
+    return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}"><em style="color:#ccc">No license information</em></div>`;
+  const badge = d.copyleft ? '<span class="badge" style="background:#e74c3c;margin-left:6px">Copyleft</span>' : '';
+  const licFiles = (d.license_files||[]).map(f=>
+    `<div style="font-family:monospace;font-size:.74rem;line-height:1.75">
+      <span>${{f.name}}</span>
+      <span style="color:var(--muted);font-size:.68rem;margin-left:6px">${{fmtSize(f.size)}}</span>
+    </div>`
+  ).join('');
+  return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}">
+    <div style="margin-bottom:10px;font-size:.85rem">
+      <strong>License:</strong> ${{d.license||'<em style="color:#ccc">unknown</em>'}}${{badge}}
+    </div>
+    <div class="detail-section">
+      <h4>License files <span class="cnt">${{(d.license_files||[]).length}}</span></h4>
+      ${{licFiles||'<em style="color:#ccc;font-size:.75rem">none collected</em>'}}
+    </div>
+  </div>`;
+}}
+
+function patchesPane(id, d, active){{
+  const patches = d.patches||[];
+  if(!patches.length)
+    return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}"><em style="color:#ccc">No patches</em></div>`;
+  const items = patches.map(p=>
+    `<div style="font-family:monospace;font-size:.74rem;line-height:1.75">
+      <span style="color:#8e44ad">${{p.name}}</span>
+      <span style="color:var(--muted);font-size:.68rem;margin-left:6px">${{fmtSize(p.size)}}</span>
+    </div>`
+  ).join('');
+  return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}">
+    <div style="color:var(--muted);font-size:.78rem;margin-bottom:8px">
+      <strong style="color:#8e44ad">${{patches.length}}</strong> patches
+    </div>
+    <div class="detail-section" style="max-height:300px;overflow-y:auto">${{items}}</div>
+  </div>`;
+}}
+
+function metadataPane(id, d, active){{
+  const rows = [
+    ['Recipe', d.recipe],
+    ['Version', d.version],
+    ['License', (d.license||'') + (d.copyleft?' <span class="badge" style="background:#e74c3c">Copyleft</span>':'')],
+    ['Homepage', d.homepage ? `<a href="${{d.homepage}}" target="_blank" style="color:var(--accent)">${{d.homepage}}</a>` : ''],
+    ['Summary', d.summary||''],
+    ['Description', d.description||''],
+    ['Section', d.section||''],
+    ['Runtime deps', d.rdepends||''],
+  ].filter(r=>r[1]);
+  const tbl = rows.map(r=>`<tr><td style="font-weight:600;color:var(--muted);white-space:nowrap;padding:4px 12px 4px 0;vertical-align:top">${{r[0]}}</td><td style="padding:4px 0">${{r[1]}}</td></tr>`).join('');
+  return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}">
+    <table style="font-size:.82rem;border-collapse:collapse;width:100%">${{tbl}}</table>
+  </div>`;
+}}
+
+function depsPane(id, d, active){{
+  const libs = d.needed_libs||[];
+  if(!libs.length)
+    return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}"><em style="color:#ccc">No shared library dependencies detected</em></div>`;
+  const hdr = `<tr><th style="text-align:left;padding:4px 8px;font-size:.73rem;color:var(--muted)">Library</th>
+    <th style="text-align:left;padding:4px 8px;font-size:.73rem;color:var(--muted)">Provider</th>
+    <th style="text-align:left;padding:4px 8px;font-size:.73rem;color:var(--muted)">License</th></tr>`;
+  const trs = libs.map(l=>{{
+    const cpBadge = l.copyleft ? ' <span class="badge" style="background:#e74c3c;font-size:.65rem">Copyleft</span>' : '';
+    return `<tr>
+      <td style="font-family:monospace;font-size:.74rem;padding:3px 8px">${{l.lib}}</td>
+      <td style="font-size:.78rem;padding:3px 8px">${{l.provider_recipe||l.provider_pkg||'<span style="color:#ccc">unknown</span>'}}</td>
+      <td style="font-size:.78rem;padding:3px 8px">${{l.provider_license||'<span style="color:#ccc">—</span>'}}${{cpBadge}}</td>
+    </tr>`;
+  }}).join('');
+  const chain = d.linking_chain||{{}};
+  const chainKeys = Object.keys(chain);
+  const copyleftDeps = chainKeys.filter(k=>{{const u=chain[k].toUpperCase(); return ['GPL','LGPL','AGPL','EUPL','MPL','CDDL','OSL'].some(kw=>u.includes(kw));}});
+  const chainNote = copyleftDeps.length
+    ? `<div style="margin-top:10px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:.78rem">
+        <strong>⚠ Copyleft linking dependencies:</strong> ${{copyleftDeps.map(k=>`${{k}} (${{chain[k]}})`).join(', ')}}
+      </div>` : '';
+  return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}">
+    <div style="color:var(--muted);font-size:.78rem;margin-bottom:8px">
+      <strong>${{libs.length}}</strong> shared libraries needed
+    </div>
+    <div class="detail-section" style="overflow-x:auto">
+      <table style="border-collapse:collapse;width:100%">${{hdr}}${{trs}}</table>
+    </div>
+    ${{chainNote}}
+  </div>`;
+}}
+
 function renderDetail(d, idx){{
   if(d.same_as)
     return `<div class="detail-panel open"><em>Sources shared with <strong>${{d.same_as}}</strong>.</em></div>`;
@@ -1918,6 +2184,13 @@ function renderDetail(d, idx){{
 
   const cuPane   = pane(`cu-${{idx}}`,   'Source files',     '#27ae60', d.cu_files,  d.cu_ext,  d.cu_total,  !d.no_src, d.source_binaries);
   const instPane = installedPane(`inst-${{idx}}`, d.installed_files, d.installed_total, d.installed_elf, d.binary_sources||{{}}, d.no_src);
+  const licPane  = licensePane(`lic-${{idx}}`, d, false);
+  const patPane  = patchesPane(`pat-${{idx}}`, d, false);
+  const metPane  = metadataPane(`meta-${{idx}}`, d, false);
+  const depPane  = depsPane(`dep-${{idx}}`, d, false);
+
+  const nLibs = (d.needed_libs||[]).length;
+  const nPat = (d.patches||[]).length;
 
   return `<div class="detail-panel open">
     ${{info}}${{shared}}
@@ -1926,8 +2199,16 @@ function renderDetail(d, idx){{
         Source Files <strong style="color:#27ae60">${{d.cu_total}}</strong></div>
       <div class="cat-tab${{d.no_src?' active':''}}" data-pane="cp-inst-${{idx}}" onclick="switchTab(this)">
         Installed Files <strong style="color:#2980b9">${{d.installed_total}}</strong></div>
+      <div class="cat-tab" data-pane="cp-lic-${{idx}}" onclick="switchTab(this)">
+        License ${{d.copyleft?'<span class="badge" style="background:#e74c3c;font-size:.6rem;vertical-align:middle">Copyleft</span>':''}}</div>
+      <div class="cat-tab" data-pane="cp-pat-${{idx}}" onclick="switchTab(this)">
+        Patches ${{nPat?'<strong style="color:#8e44ad">'+nPat+'</strong>':''}}</div>
+      <div class="cat-tab" data-pane="cp-meta-${{idx}}" onclick="switchTab(this)">
+        Metadata</div>
+      <div class="cat-tab" data-pane="cp-dep-${{idx}}" onclick="switchTab(this)">
+        Dependencies ${{nLibs?'<strong style="color:#e67e22">'+nLibs+'</strong>':''}}</div>
     </div>
-    ${{cuPane}}${{instPane}}
+    ${{cuPane}}${{instPane}}${{licPane}}${{patPane}}${{metPane}}${{depPane}}
   </div>`;
 }}
 
@@ -1958,14 +2239,17 @@ function renderTable(){{
 
   const tbody=document.getElementById('tblBody');
   tbody.innerHTML=rows.map((d,idx)=>{{
+    const cpBadge = d.copyleft ? ' <span class="badge" style="background:#e74c3c;font-size:.6rem">Copyleft</span>' : '';
+    const licText = d.license ? (d.license.length>35 ? d.license.substring(0,35)+'…' : d.license) : '<span style="color:#ccc">—</span>';
     return `<tr class="data-row" data-name="${{d.name}}">
       <td><strong>${{d.name}}</strong></td>
       <td style="color:#555">${{d.recipe}}</td>
       <td><span class="badge" style="background:${{d.color}}">${{d.type_label}}</span></td>
+      <td style="font-size:.78rem">${{licText}}${{cpBadge}}</td>
       <td class="num" style="color:#27ae60">${{fmt(d.cu_total)}}</td>
       <td class="num" style="color:#2980b9">${{fmt(d.installed_total)}}</td>
     </tr>
-    <tr class="detail-row"><td colspan="5">${{renderDetail(d,idx)}}</td></tr>`;
+    <tr class="detail-row"><td colspan="6">${{renderDetail(d,idx)}}</td></tr>`;
   }}).join('');
 
   tbody.querySelectorAll('tr.data-row').forEach(tr=>{{
@@ -2087,6 +2371,11 @@ class Reporter:
         machine = self.session.machine
         pkgdata_runtime = build_dir / "tmp" / "pkgdata" / machine / "runtime"
 
+        shlibs_map = build_shlibs_map(build_dir, machine)
+        license_cache: dict[str, str] = {}
+        licenses_dir = self.session.output_dir / "licenses"
+        patches_dir = self.session.output_dir / "patches"
+
         work_ver_map: dict[str, list[str]] = {}
         for pkg in packages:
             if pkg.work_ver and pkg.pkg_type == "userspace":
@@ -2129,6 +2418,38 @@ class Reporter:
                 cu_path_set = {f["path"] for f in cu_files}
                 xcheck = _dwarf_cross_check(installed_files, pkg_split, cu_path_set)
 
+            # License and metadata
+            metadata = get_pkg_metadata(pkgdata_runtime, pkg.yocto_pkg)
+            license_str = metadata.get("license", "")
+            copyleft = is_copyleft(license_str) if license_str else False
+
+            # License files from collected output
+            lic_dir = licenses_dir / pkg.recipe
+            license_file_list: list[dict] = []
+            if lic_dir.exists():
+                for f in sorted(lic_dir.iterdir()):
+                    if f.is_file():
+                        license_file_list.append({
+                            "name": f.name,
+                            "size": f.stat().st_size,
+                        })
+
+            # Patches from collected output
+            pat_dir = patches_dir / pkg.recipe
+            patch_list: list[dict] = []
+            if pat_dir.exists():
+                for f in sorted(pat_dir.iterdir()):
+                    if f.is_file():
+                        patch_list.append({
+                            "name": f.name,
+                            "size": f.stat().st_size,
+                        })
+
+            # Linking dependencies
+            deps = resolve_linking_deps(
+                installed_files, pkg_split, shlibs_map,
+                pkgdata_runtime, license_cache)
+
             rows.append({
                 "name":       pkg.installed_name,
                 "recipe":     pkg.recipe,
@@ -2148,12 +2469,25 @@ class Reporter:
                 "installed_elf":   elf_count,
                 "binary_sources":  xcheck["binary_sources"],
                 "source_binaries": xcheck["source_binaries"],
+                "license":         license_str,
+                "copyleft":        copyleft,
+                "license_files":   license_file_list,
+                "patches":         patch_list,
+                "homepage":        metadata.get("homepage", ""),
+                "description":     metadata.get("description", ""),
+                "summary":         metadata.get("summary", ""),
+                "section":         metadata.get("section", ""),
+                "rdepends":        metadata.get("rdepends", ""),
+                "needed_libs":     deps["needed_libs"],
+                "linking_chain":   deps["linking_chain"],
             })
         return rows
 
     def render_html(self, rows: list[dict]) -> str:
         total_cu  = sum(r["cu_total"]  for r in rows)
         total_installed = sum(r["installed_total"] for r in rows)
+        total_copyleft = sum(1 for r in rows if r.get("copyleft"))
+        total_patches = sum(len(r.get("patches", [])) for r in rows)
 
         image = (self.session.manifest_path.stem
                  if self.session.manifest_path
@@ -2166,6 +2500,8 @@ class Reporter:
             total_pkgs = len(rows),
             total_cu   = f"{total_cu:,}",
             total_installed = f"{total_installed:,}",
+            total_copyleft = total_copyleft,
+            total_patches = f"{total_patches:,}",
             data_json  = json.dumps(rows, indent=None),
         )
 

@@ -38,33 +38,37 @@ Output goes to `./output/` by convention:
 ./output/
     sources/          # collected source files per package
     sources/MANIFEST.txt  # source counts summary
-    report.html       # interactive HTML report
+    licenses/         # license text files per recipe (deduplicated)
+    patches/          # applied patches per recipe (deduplicated)
+    report.html       # interactive HTML report (with license, patch, metadata, and dependency tabs)
 ```
 
 There is no test suite, linter, or build system.
 
 ## Architecture
 
-Single-file script: `yocto/source_audit.py` (~2600 lines)
+Single-file script: `yocto/source_audit.py` (~2900 lines)
 
 The script is organized into logical sections:
 
-1. **Constants & Data classes** — `KernelInfo`, `PackageInfo`, `CompileCmd` dataclasses; `SOURCE_EXTS`, `KERNEL_IMAGE_GLOBS`, regex constants
+1. **Constants & Data classes** — `KernelInfo`, `PackageInfo`, `CompileCmd` dataclasses; `SOURCE_EXTS`, `KERNEL_IMAGE_GLOBS`, regex constants; `_COPYLEFT_KEYWORDS`, `is_copyleft()`
 2. **Discovery** — `discover_packages()`, pkgdata helpers, manifest parsing, DWARF extraction, ELF helpers, argparse setup
-3. **Compile-log parsing** — `parse_compile_log()`, `check_coverage()`, `compile_test()`, `_make_shadow_cmd()`
-4. **YoctoSession** — Shared state dataclass with `from_args()`, `discover()`, `sources_dir` property
-5. **Collector** — Collects DWARF-confirmed source files per package
-6. **Verifier** — Cross-checks collected sources against DWARF CU paths
-7. **Reporter** — Generates self-contained HTML report with Chart.js
-8. **HTML template** — Inline HTML/CSS/JS template string
-9. **CLI** — Unified entry point with subcommands: `collect`, `verify`, `test`, `report`, `all`
+3. **License/patch/metadata helpers** — `get_license_files()`, `get_patch_files()`, `get_pkg_metadata()`, `build_shlibs_map()`, `get_needed_libs()`, `resolve_linking_deps()`
+4. **Compile-log parsing** — `parse_compile_log()`, `check_coverage()`, `compile_test()`, `_make_shadow_cmd()`
+5. **YoctoSession** — Shared state dataclass with `from_args()`, `discover()`, `sources_dir` property
+6. **Collector** — Collects DWARF-confirmed source files, license texts, and patches per package/recipe
+7. **Verifier** — Cross-checks collected sources against DWARF CU paths
+8. **Reporter** — Generates self-contained HTML report with Chart.js
+9. **HTML template** — Inline HTML/CSS/JS template string with 6 detail tabs per package
+10. **CLI** — Unified entry point with subcommands: `collect`, `verify`, `test`, `report`, `all`
 
 ### Key classes
 
 - **`YoctoSession`** — shared state (build_dir, manifest, machine, output_dir, cached package discovery)
-- **`Collector`** — collects DWARF-confirmed source files (compiled+used only, for OSS clearance)
+- **`Collector`** — collects DWARF-confirmed source files, license texts (`output/licenses/`), and patches (`output/patches/`) per recipe (deduplicated)
 - **`Verifier`** — different verification strategies per package type (userspace DWARF, kernel `.o` cross-check, module `.mod` files)
-- **`Reporter`** — generates interactive HTML report with per-package detail panels
+- **`Reporter`** — generates interactive HTML report with 6 per-package detail tabs: Source Files, Installed Files, License, Patches, Metadata, Dependencies
+- **Linking analysis** — `build_shlibs_map()` parses `shlibs2/*.list` to map sonames to provider packages; `resolve_linking_deps()` runs `readelf -d` on installed ELFs and resolves NEEDED libs to provider recipes/licenses, flagging copyleft dependencies
 
 ## Key Patterns
 
