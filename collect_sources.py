@@ -95,7 +95,8 @@ def _collect_category(
 
 # ── Userspace collection ──────────────────────────────────────────────────────
 
-def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
+def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path,
+                      build_dir: Path | None = None) -> dict:
     """
     Collect sources for a userspace package in three categories:
 
@@ -124,26 +125,46 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
     # ── Try DWARF-based per-binary collection ──────────────────────────────
     installed_elfs = yu.find_installed_elfs(pkg_split)
     if installed_elfs:
-        dwarf_rels: set[str] = set()
-        src_roots:  set[str] = set()
+        # dwarf_items: list of (abs_source_path, stripped_dst_rel)
+        dwarf_items: list[tuple[Path, str]] = []
+        dwarf_abs:   set[Path] = set()
+        src_roots:   set[str] = set()
 
         for elf in installed_elfs:
             dbg = yu.find_debug_counterpart(elf, pkg_split)
             target = dbg if (dbg and dbg.exists()) else elf
             for path in yu.extract_dwarf_cu_sources(target):
                 if path.startswith(prefix):
+                    # Standard recipe-prefix path
                     rel = path[len(prefix):]
                     if rel and not rel.startswith("<"):
-                        dwarf_rels.add(rel)
-                        parts = Path(rel).parts
+                        src = pkg_info.work_ver / rel
+                        dst = yu.strip_src_root(rel)
+                        if src not in dwarf_abs:
+                            dwarf_items.append((src, dst))
+                            dwarf_abs.add(src)
+                            parts = Path(rel).parts
+                            if len(parts) > 1:
+                                src_roots.add(parts[0])
+                elif build_dir and "/work-shared/" in path:
+                    # work-shared path (e.g. gcc-runtime): resolve to
+                    # build_dir/tmp/work-shared/... and strip after recipe-ver dir
+                    ws_idx = path.find("/work-shared/")
+                    ws_rel = path[ws_idx + 1:]  # "work-shared/gcc-9.5.0-r0/..."
+                    src = build_dir / "tmp" / ws_rel
+                    # Strip "work-shared/" then strip the recipe-ver root
+                    after_ws = ws_rel.split("/", 1)[1] if "/" in ws_rel else ""
+                    dst = yu.strip_src_root(after_ws) if after_ws else ""
+                    if dst and not dst.startswith("<") and src not in dwarf_abs:
+                        dwarf_items.append((src, dst))
+                        dwarf_abs.add(src)
+                        parts = Path(after_ws).parts
                         if len(parts) > 1:
                             src_roots.add(parts[0])
 
-        if dwarf_rels:
+        if dwarf_items:
             # ── Category 1: compiled + used (DWARF) ───────────────────────
-            for rel in dwarf_rels:
-                src     = pkg_info.work_ver / rel
-                dst_rel = yu.strip_src_root(rel)
+            for src, dst_rel in dwarf_items:
                 if copy_source(src, pkg_out / dst_rel):
                     counts["compiled_used"] += 1
                 else:
@@ -154,28 +175,36 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
             debugsources = pkg_info.work_ver / "debugsources.list"
             if debugsources.exists():
                 for debug_path in yu.read_debugsources(debugsources):
-                    if not debug_path.startswith(prefix):
-                        continue
-                    rel = debug_path[len(prefix):]
-                    if not rel or rel.startswith("<"):
-                        continue
-                    if not rel.endswith(".h"):
-                        continue
-                    src     = pkg_info.work_ver / rel
-                    dst_rel = yu.strip_src_root(rel)
-                    if copy_source(src, pkg_out / dst_rel):
-                        counts["compiled_used"] += 1
+                    src_h = None
+                    dst_rel_h = None
+                    if debug_path.startswith(prefix):
+                        rel = debug_path[len(prefix):]
+                        if not rel or rel.startswith("<") or not rel.endswith(".h"):
+                            continue
+                        src_h = pkg_info.work_ver / rel
+                        dst_rel_h = yu.strip_src_root(rel)
+                    elif build_dir and "/work-shared/" in debug_path:
+                        if not debug_path.endswith(".h"):
+                            continue
+                        ws_idx = debug_path.find("/work-shared/")
+                        ws_rel = debug_path[ws_idx + 1:]
+                        src_h = build_dir / "tmp" / ws_rel
+                        after_ws = ws_rel.split("/", 1)[1] if "/" in ws_rel else ""
+                        dst_rel_h = yu.strip_src_root(after_ws) if after_ws else ""
+                    if src_h and dst_rel_h:
+                        if copy_source(src_h, pkg_out / dst_rel_h):
+                            counts["compiled_used"] += 1
 
             # ── Category 2: compiled + not-used (in log, not in DWARF) ────
             if compiled_srcs:
                 cat2: list[tuple[Path, str]] = []
                 for abs_src in compiled_srcs:
+                    if abs_src in dwarf_abs:
+                        continue   # already in category 1
                     try:
                         rel = str(abs_src.relative_to(pkg_info.work_ver))
                     except ValueError:
                         continue
-                    if rel in dwarf_rels:
-                        continue   # already in category 1
                     cat2.append((abs_src, yu.strip_src_root(rel)))
                 counts["compiled_not_used"] = _collect_category(
                     cat2, pkg_out / "_compiled_not_used"
@@ -183,7 +212,6 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
 
             # ── Category 3: never compiled (in source tree, not in log) ───
             if src_roots:
-                dwarf_abs: set[Path] = {pkg_info.work_ver / r for r in dwarf_rels}
                 cat3: list[tuple[Path, str]] = []
                 for root_name in src_roots:
                     if yu.is_build_dir(root_name):
@@ -202,6 +230,46 @@ def collect_userspace(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                         cat3.append((src_file, yu.strip_src_root(rel_full)))
                 counts["never_used"] = _collect_category(
                     cat3, pkg_out / "_never_used"
+                )
+
+            return counts
+
+        # ── Fix 2: No DWARF data but compile log has entries ──────────────
+        # Packages built without -g (e.g. libcurl4): promote compile-log
+        # sources to compiled+used since they are the installed binary's code.
+        if compiled_srcs:
+            for abs_src in compiled_srcs:
+                try:
+                    rel = str(abs_src.relative_to(pkg_info.work_ver))
+                except ValueError:
+                    continue
+                dst_rel = yu.strip_src_root(rel)
+                if copy_source(abs_src, pkg_out / dst_rel):
+                    counts["compiled_used"] += 1
+                    parts = Path(rel).parts
+                    if len(parts) > 1:
+                        src_roots.add(parts[0])
+
+            # Category 3: never compiled (walk source roots)
+            if src_roots:
+                cat3_nodwarf: list[tuple[Path, str]] = []
+                for root_name in src_roots:
+                    if yu.is_build_dir(root_name):
+                        continue
+                    root_dir = pkg_info.work_ver / root_name
+                    if not root_dir.exists():
+                        continue
+                    for src_file in root_dir.rglob("*"):
+                        if not src_file.is_file():
+                            continue
+                        if src_file in compiled_srcs:
+                            continue
+                        if not _is_collectible(src_file):
+                            continue
+                        rel_full = str(src_file.relative_to(pkg_info.work_ver))
+                        cat3_nodwarf.append((src_file, yu.strip_src_root(rel_full)))
+                counts["never_used"] = _collect_category(
+                    cat3_nodwarf, pkg_out / "_never_used"
                 )
 
             return counts
@@ -305,12 +373,17 @@ def collect_kernel_image(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
     # ── Step 2: headers from Kbuild .cmd dependency files ─────────────────
     src_prefix = str(k.src_dir)
     collected_h: set[str] = set()
+    # Track compiled stems (relative to src_dir) for Step 3
+    compiled_stems: set[str] = set()
 
     for o_file in k.build_dir.rglob("*.o"):
         if o_file in module_objs:
             continue
         if o_file.name.startswith(".") or o_file.name.endswith(".mod.o"):
             continue
+        rel = o_file.relative_to(k.build_dir)
+        compiled_stems.add(str(rel.parent / rel.stem))
+
         cmd_file = o_file.parent / f".{o_file.name}.cmd"
         if not cmd_file.exists():
             continue
@@ -333,18 +406,40 @@ def collect_kernel_image(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                 collected_h.add(h)
                 counts["h"] += 1
 
+    # ── Step 3: never-compiled source files (.c / .S) ──────────────────
+    counts["never_used"] = 0
+    never_out = pkg_out / "_never_used"
+    for ext in (".c", ".S"):
+        for src_file in k.src_dir.rglob(f"*{ext}"):
+            if not src_file.is_file():
+                continue
+            try:
+                rel_src = src_file.relative_to(k.src_dir)
+            except ValueError:
+                continue
+            stem = str(rel_src.parent / rel_src.stem)
+            if stem in compiled_stems:
+                continue   # has matching .o → compiled
+            if copy_source(src_file, never_out / rel_src):
+                counts["never_used"] += 1
+
     return counts
 
 
 def collect_kernel_module(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
-    """Collect sources for a kernel module using its .mod file entries."""
+    """Collect sources for a kernel module using its .mod file entries.
+
+    Step 1 — .c / .S: for each .o in the .mod file, copy the matching source.
+    Step 2 — .h: parse Kbuild .*.o.cmd files to collect referenced headers.
+    """
     k = pkg_info.kernel
     if k is None:
-        return {"c": 0, "S": 0, "missing": 0, "error": "no kernel info"}
+        return {"c": 0, "S": 0, "h": 0, "missing": 0, "error": "no kernel info"}
 
     pkg_out = out_dir / pkg_info.installed_name
-    counts = {"c": 0, "S": 0, "missing": 0}
+    counts = {"c": 0, "S": 0, "h": 0, "missing": 0}
 
+    # ── Step 1: source files (.c / .S) ────────────────────────────────────
     for obj_rel in pkg_info.kernel_mod_obj_rels:
         rel = Path(obj_rel)
         found = False
@@ -356,6 +451,34 @@ def collect_kernel_module(pkg_info: yu.PackageInfo, out_dir: Path) -> dict:
                 break
         if not found:
             counts["missing"] += 1
+
+    # ── Step 2: headers from Kbuild .cmd dependency files ─────────────────
+    src_prefix = str(k.src_dir)
+    collected_h: set[str] = set()
+
+    for obj_rel in pkg_info.kernel_mod_obj_rels:
+        o_file = k.build_dir / obj_rel
+        cmd_file = o_file.parent / f".{o_file.name}.cmd"
+        if not cmd_file.exists():
+            continue
+        try:
+            text = cmd_file.read_text(errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            h = line.strip().rstrip("\\").strip()
+            if not h.endswith(".h") or not h.startswith(src_prefix):
+                continue
+            if h in collected_h:
+                continue
+            h_path = Path(h)
+            try:
+                rel_h = h_path.relative_to(k.src_dir)
+            except ValueError:
+                continue
+            if copy_source(h_path, pkg_out / rel_h):
+                collected_h.add(h)
+                counts["h"] += 1
 
     return counts
 
@@ -460,7 +583,7 @@ def main():
             if not kernel_image_done.get(key):
                 counts = collect_kernel_image(pkg, out_dir)
                 kernel_image_done[key] = True
-                print(f"  → c={counts['c']}  h={counts['h']}  S={counts['S']}  missing={counts['missing']}")
+                print(f"  → c={counts['c']}  h={counts['h']}  S={counts['S']}  missing={counts['missing']}  never-used={counts.get('never_used', 0)}")
             else:
                 note_dir = out_dir / pkg.installed_name
                 note_dir.mkdir(parents=True, exist_ok=True)
@@ -480,11 +603,11 @@ def main():
 
         if pkg.pkg_type == "kernel_module":
             counts = collect_kernel_module(pkg, out_dir)
-            print(f"  → c={counts['c']}  S={counts['S']}  missing={counts['missing']}")
+            print(f"  → c={counts['c']}  h={counts.get('h', 0)}  S={counts['S']}  missing={counts['missing']}")
             continue
 
         # userspace
-        counts = collect_userspace(pkg, out_dir)
+        counts = collect_userspace(pkg, out_dir, build_dir)
         print(f"  → compiled+used={counts['compiled_used']}  "
               f"compiled+not-used={counts['compiled_not_used']}  "
               f"never-used={counts['never_used']}  "

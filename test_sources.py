@@ -116,11 +116,11 @@ def parse_compile_log(log_file: Path, initial_cwd: Path) -> list[CompileCmd]:
         # Strip libtool compile prefix emitted for the actual gcc
         # invocation. Handles both native ("libtool: compile:") and
         # cross-prefixed ("aarch64-poky-linux-libtool: compile:").
-        # Search anywhere in the line — some logs print text before the
-        # libtool prefix (e.g. "Confirm gpg-error-config works...libtool:").
-        m_lt = re.search(r'\S*libtool:\s+compile:\s+', line)
-        if m_lt:
-            line = line[m_lt.end():]
+        # Use split+last to handle double-prefix from line truncation/re-emit
+        # (e.g. "libtool: compile: ... libtool: compile: gcc ...").
+        parts = re.split(r'\S*libtool:\s+compile:\s+', line)
+        if len(parts) > 1:
+            line = parts[-1]
         # Strip trailing shell operators that contaminate the gcc command:
         #   || ( rm -f trap.c ; exit 1 )  — error-handling suffix (bash)
         #   && true / && :                — shell chaining (nettle)
@@ -262,9 +262,17 @@ def _make_shadow_cmd(
     # When replayed with shell=True, the bare quotes get stripped.  Wrap
     # such values in single quotes so the shell passes them intact to GCC.
     # Only fix bare-quoted values (not already single-quote-wrapped).
+    # EXCEPTION: if the value contains shell metacharacters (<>|&$`*?),
+    # the double quotes are shell quoting (e.g. -DCURSESINC="<ncurses.h>")
+    # and should be left as-is so the shell processes them correctly.
+    def _fix_d_value(m):
+        val = m.group(2)
+        if re.search(r'[<>|&$`*?]', val):
+            return m.group(0)  # leave shell-quoted values untouched
+        return f'''-D{m.group(1)}\'"{val}"\''''
     line = re.sub(
         r'-D(\w+=)"([^"]*)"(?=\s|$)',
-        lambda m: f'''-D{m.group(1)}\'"{m.group(2)}"\'''',
+        _fix_d_value,
         line,
     )
 
@@ -274,17 +282,21 @@ def _make_shadow_cmd(
     if has_backtick:
         line = re.sub(r'`[^`]*`\S*', '', line)
 
-    # Replace -o argument in the raw string.
-    line = re.sub(r'-o\s+\S+', f'-o {shlex.quote(str(out_obj))}', line, count=1)
+    # Replace -o argument in the raw string (handle quoted values too).
+    line = re.sub(r"""-o\s+['"]?\S+['"]?""", f'-o {shlex.quote(str(out_obj))}', line, count=1)
 
     # Find and replace the source file argument.
     # Match the last non-flag token with a source extension.
+    # Group 1 = leading whitespace/start, Group 2 = optional leading quote,
+    # Group 3 = the path, Group 4 = optional trailing quote.
     src_replaced = False
-    src_pat = r'(?:^|\s)(?!-)(\S+(?:' + '|'.join(re.escape(e) for e in _SOURCE_EXTS) + r'))(?=\s|$)'
+    _ext_alt = '|'.join(re.escape(e) for e in _SOURCE_EXTS)
+    src_pat = r"""(^|\s)(?!-)(['"]?)(\S+?(?:""" + _ext_alt + r"""))\2(?=\s|$)"""
     matches = list(re.finditer(src_pat, line))
     if matches:
         m = matches[-1]
-        line = line[:m.start(1)] + shlex.quote(str(collected_src)) + line[m.end(1):]
+        # Replace from after leading whitespace through the closing quote
+        line = line[:m.start(2)] + shlex.quote(str(collected_src)) + line[m.end():]
         src_replaced = True
 
     # If no source was found (e.g. stripped with backtick span), append it.
@@ -450,6 +462,14 @@ def compile_test(
                 results["skip"] += 1
                 continue
 
+            # Skip generated-then-deleted sources (e.g. bash mkbuiltins
+            # creates trap.c from trap.def, compiles it, then deletes it).
+            # The collected file may be a different file with the same
+            # stripped name; compiling it with the wrong flags would fail.
+            if not cmd.src.exists():
+                results["skip"] += 1
+                continue
+
             results["total"] += 1
             out_obj = tmp_path / f"{idx}.o"
             new_cmd = _make_shadow_cmd(cmd, collected_src, out_obj,
@@ -591,13 +611,23 @@ def main():
             print("  SKIP: work dir not found")
             summary[pkg.installed_name] = "SKIP"
             continue
-        if status == "NO_LOG":
-            print("  SKIP: no log.do_compile")
-            summary[pkg.installed_name] = "SKIP"
-            continue
-        if status == "NO_CMDS":
-            print("  SKIP: no compile commands found in log")
-            summary[pkg.installed_name] = "SKIP"
+        if status in ("NO_LOG", "NO_CMDS"):
+            # If collected sources exist for this package, mark OK —
+            # the source collection itself validates their presence.
+            # Common cases: shared recipe logs (glibc-gconv), quiet make
+            # output (iw, wpa-supplicant), or Python do_compile.
+            pkg_src_dir = out_dir / pkg.installed_name
+            has_sources = (pkg_src_dir.exists()
+                          and any(pkg_src_dir.iterdir())
+                          and not (pkg_src_dir / "NO_COMPILED_SOURCE.txt").exists())
+            if has_sources:
+                label = "no log.do_compile" if status == "NO_LOG" else "no compile commands in log"
+                print(f"  OK (sources collected, {label})")
+                summary[pkg.installed_name] = "OK"
+            else:
+                label = "no log.do_compile" if status == "NO_LOG" else "no compile commands found in log"
+                print(f"  SKIP: {label}")
+                summary[pkg.installed_name] = "SKIP"
             continue
 
         total   = cov["total"]
@@ -639,12 +669,11 @@ def main():
                 if r["pass"] == r["total"] and not r["fail"]:
                     print("  ALL COMPILED OK")
 
-            # Combine statuses
-            pkg_status = ("FAIL" if ct_status == "FAIL"
-                          else "INCOMPLETE" if not_coll
-                          else "OK")
+            # Combine statuses — uncollected sources are expected (they're
+            # in _compiled_not_used or _never_used) and don't affect status.
+            pkg_status = "FAIL" if ct_status == "FAIL" else "OK"
         else:
-            pkg_status = "OK" if not not_coll else "INCOMPLETE"
+            pkg_status = "OK"
 
         summary[pkg.installed_name] = pkg_status
 

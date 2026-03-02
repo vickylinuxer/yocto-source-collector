@@ -65,6 +65,9 @@ Uses DWARF per-binary collection for userspace; `.o`-based collection for kernel
 - Recipe prefix: `/usr/src/debug/{recipe}/{ver}/` — used to filter DWARF paths to same-recipe sources
 - External tools required: `readelf` (DWARF), `objcopy` (.o comparison)
 - `.o` mismatch in compile tests is expected (due to `-fdebug-prefix-map`) and reported separately from failures
+- **Synthetic kernel-image**: The rootfs manifest lists `kernel-<version>` → `kernel-base` (a meta-package), not the actual `kernel-image-image`. `discover_packages()` injects a synthetic `kernel-image-image` entry from pkgdata when no `kernel_image` type is found.
+- **Split-recipe packages**: Recipes like `glibc-locale` package pre-built binaries from `glibc` but have no `log.do_compile`. These are classified as `no_source` since compilation happened in the parent recipe.
+- **Kernel module headers**: `collect_kernel_module()` collects `.h` headers by parsing Kbuild `.*.o.cmd` dependency files, same as `collect_kernel_image()` Step 2.
 
 ## Compile Test Internals (`test_sources.py --compile`)
 
@@ -72,11 +75,15 @@ The compile test replays original gcc commands with the collected source copy vi
 
 - **Ninja/meson progress prefix**: Meson/ninja builds prefix compile lines with `[N/M]` (e.g. `[1/88] gcc ...`). `parse_compile_log` strips this prefix before parsing so it doesn't leak into the replayed command.
 
-- **Cross-libtool prefix**: Libtool emits the actual gcc command as `<cross-prefix>libtool: compile:  gcc ...`. The cross-prefixed variant (e.g. `aarch64-poky-linux-libtool: compile:`) is matched by `\S*libtool:\s+compile:\s+` (searched anywhere in the line, not just at the start) and stripped. This handles cases where text precedes the libtool prefix (e.g. `Confirm gpg-error-config works...libtool: compile:`). The wrapper invocation (`--mode=compile`) is skipped entirely.
+- **Cross-libtool prefix**: Libtool emits the actual gcc command as `<cross-prefix>libtool: compile:  gcc ...`. The cross-prefixed variant (e.g. `aarch64-poky-linux-libtool: compile:`) is matched by `\S*libtool:\s+compile:\s+` and stripped using `re.split` + take the last element. This handles both single and double libtool prefixes (from line truncation/re-emit in long lines like libgnutls30). The wrapper invocation (`--mode=compile`) is skipped entirely.
 
 - **Shell operators**: Trailing `|| ( ... )` error-handling (bash), `&& true`/`&& :` chaining (nettle), and `>/dev/null 2>&1` redirections (sudo) are all stripped before tokenization.
 
-- **Bare-quoted -D values**: The compile log shows post-shell-expansion text, so `-DNAME="value"` loses its quotes when replayed via `shell=True`. `_make_shadow_cmd` wraps bare-quoted -D values in single quotes: `-DNAME='"value"'` so the shell passes them intact to GCC. Already-single-quoted values (e.g. `-DPROGRAM='"bash"'`) are left untouched.
+- **Bare-quoted -D values**: The compile log may show `-DNAME="value"` where the double quotes are C string delimiters that need preserving. `_make_shadow_cmd` wraps such values in single quotes: `-DNAME='"value"'`. However, values containing shell metacharacters (`<>|&$` etc.) are left untouched — the double quotes are shell protection, not C quoting (e.g. `-DCURSESINC="<ncurses.h>"` uses quotes to protect angle brackets from shell redirection). Already-single-quoted values (e.g. `-DPROGRAM='"bash"'`) are left untouched.
+
+- **Quoted source arguments**: Meson/ninja builds may quote source file arguments (e.g. `-c 'xkbcommon@sha/parser.c'`). The source file regex in `_make_shadow_cmd` uses backreference matching to handle both quoted and unquoted source tokens.
+
+- **Generated-then-deleted sources**: Some build systems generate temporary `.c` files, compile them, then delete them (e.g. bash `mkbuiltins` generates `trap.c` from `trap.def`). If the original source no longer exists on disk, the compile test skips it to avoid compiling the wrong file (a different file may share the same stripped name).
 
 - **Backtick VPATH expansion**: Some build systems (e.g. util-linux) use `` `test -f 'src.c' || echo '../pkg-ver/'`src.c `` in commands. `_make_shadow_cmd` strips backtick spans via regex and appends the collected source explicitly.
 
