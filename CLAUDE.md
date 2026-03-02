@@ -4,72 +4,80 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tools for collecting, verifying, and compile-testing the source files that were actually compiled into a Yocto image's installed binaries. All scripts are standalone Python 3.10+ CLI tools that operate on a Yocto build directory.
+Tools for collecting, verifying, and compile-testing the source files that were actually compiled into a Yocto image's installed binaries. A single Python 3.10+ script (`yocto/source_audit.py`) with a unified CLI that operates on a Yocto build directory.
 
 ## Running the Tools
 
-All scripts require a Yocto build directory (`$BUILDDIR`) and an image manifest. Source the Yocto build environment first or pass paths explicitly.
+All commands require a Yocto build directory (`$BUILDDIR`) and an image manifest. Source the Yocto build environment first or pass paths explicitly.
 
 ```bash
-# Collect sources into ./sources
-python3 collect_sources.py -b $BUILDDIR -m core-image-minimal -o ./sources
+# Collect sources into ./output/sources/
+python3 yocto/source_audit.py collect -b $BUILDDIR -m core-image-minimal --clean
 
 # Verify collected sources against DWARF debug info
-python3 verify_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources
+python3 yocto/source_audit.py verify -b $BUILDDIR -m core-image-minimal
 
 # Check coverage (which compiled sources are collected)
-python3 test_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources
+python3 yocto/source_audit.py test -b $BUILDDIR -m core-image-minimal
 
 # Re-compile using collected sources and verify success
-python3 test_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources --compile
+python3 yocto/source_audit.py test -b $BUILDDIR -m core-image-minimal --compile
 
 # Test specific packages only
-python3 test_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources --compile -p busybox,dropbear
+python3 yocto/source_audit.py test -b $BUILDDIR -m core-image-minimal --compile -p busybox,dropbear
 
 # Generate interactive HTML report
-python3 report.py -b $BUILDDIR -m core-image-minimal -s ./sources -o report.html
+python3 yocto/source_audit.py report -b $BUILDDIR -m core-image-minimal
+
+# Run collect + report in sequence
+python3 yocto/source_audit.py all -b $BUILDDIR -m core-image-minimal --clean
 ```
 
-There is no test suite, linter, or build system — these are standalone scripts.
+Output goes to `./output/` by convention:
+```
+./output/
+    sources/          # collected source files per package
+    sources/MANIFEST.txt  # source counts summary
+    report.html       # interactive HTML report
+```
+
+There is no test suite, linter, or build system.
 
 ## Architecture
 
-**`yocto_source_utils.py`** — Shared library imported by all other scripts as `yu`. Contains:
-- `PackageInfo` / `KernelInfo` dataclasses — core data model for discovered packages
-- `discover_packages()` — reads rootfs manifest + pkgdata to build the package list
-- DWARF extraction (`extract_dwarf_cu_sources`) via `readelf` subprocess
-- Common argparse setup (`add_common_args` / `resolve_common_args`)
-- Helpers: `strip_src_root()`, `is_build_dir()`, `find_debug_counterpart()`
+Single-file script: `yocto/source_audit.py` (~2600 lines)
 
-**`collect_sources.py`** — Collects source files into three categories per package:
-- `<pkg>/` — compiled+used (DWARF-confirmed)
-- `<pkg>/_compiled_not_used/` — compiled but not in installed binary
-- `<pkg>/_never_used/` — in source tree but never compiled
+The script is organized into logical sections:
 
-Uses DWARF per-binary collection for userspace; `.o`-based collection for kernel image; `.mod` file enumeration for kernel modules.
+1. **Constants & Data classes** — `KernelInfo`, `PackageInfo`, `CompileCmd` dataclasses; `SOURCE_EXTS`, `KERNEL_IMAGE_GLOBS`, regex constants
+2. **Discovery** — `discover_packages()`, pkgdata helpers, manifest parsing, DWARF extraction, ELF helpers, argparse setup
+3. **Compile-log parsing** — `parse_compile_log()`, `check_coverage()`, `compile_test()`, `_make_shadow_cmd()`
+4. **YoctoSession** — Shared state dataclass with `from_args()`, `discover()`, `sources_dir` property
+5. **Collector** — Collects DWARF-confirmed source files per package
+6. **Verifier** — Cross-checks collected sources against DWARF CU paths
+7. **Reporter** — Generates self-contained HTML report with Chart.js
+8. **HTML template** — Inline HTML/CSS/JS template string
+9. **CLI** — Unified entry point with subcommands: `collect`, `verify`, `test`, `report`, `all`
 
-**`verify_sources.py`** — Cross-checks collected sources against DWARF CU paths from `.debug` binaries. Different verification strategies per package type (userspace DWARF, kernel `.o` cross-check, module `.mod` files).
+### Key classes
 
-**`test_sources.py`** — Parses `log.do_compile` to extract gcc `-c` invocations, tracks CWD via `make[N]: Entering/Leaving` lines. Coverage mode checks file presence; `--compile` mode re-runs each command with the collected source copy. Exports `parse_compile_log`, `check_coverage` (used by `collect_sources.py` and `report.py`).
-
-**`report.py`** — Generates a self-contained HTML report with Chart.js. Imports `check_coverage` from `test_sources.py`.
-
-### Cross-script data flow
-
-`collect_sources.py` and `report.py` both import from `test_sources.py` (`parse_compile_log`, `check_coverage`). Changes to the compile-log parsing or coverage API affect all three scripts.
+- **`YoctoSession`** — shared state (build_dir, manifest, machine, output_dir, cached package discovery)
+- **`Collector`** — collects DWARF-confirmed source files (compiled+used only, for OSS clearance)
+- **`Verifier`** — different verification strategies per package type (userspace DWARF, kernel `.o` cross-check, module `.mod` files)
+- **`Reporter`** — generates interactive HTML report with per-package detail panels
 
 ## Key Patterns
 
-- Package types: `userspace`, `kernel_image`, `kernel_module`, `no_source` — all scripts branch on `pkg.pkg_type`
+- Package types: `userspace`, `kernel_image`, `kernel_module`, `no_source` — all classes branch on `pkg.pkg_type`
 - Source-root stripping: Yocto unpacks into versioned dirs (e.g. `busybox-1.35.0/`); `strip_src_root()` removes this prefix for stored paths
 - Recipe prefix: `/usr/src/debug/{recipe}/{ver}/` — used to filter DWARF paths to same-recipe sources
 - External tools required: `readelf` (DWARF), `objcopy` (.o comparison)
 - `.o` mismatch in compile tests is expected (due to `-fdebug-prefix-map`) and reported separately from failures
 - **Synthetic kernel-image**: The rootfs manifest lists `kernel-<version>` → `kernel-base` (a meta-package), not the actual `kernel-image-image`. `discover_packages()` injects a synthetic `kernel-image-image` entry from pkgdata when no `kernel_image` type is found.
 - **Split-recipe packages**: Recipes like `glibc-locale` package pre-built binaries from `glibc` but have no `log.do_compile`. These are classified as `no_source` since compilation happened in the parent recipe.
-- **Kernel module headers**: `collect_kernel_module()` collects `.h` headers by parsing Kbuild `.*.o.cmd` dependency files, same as `collect_kernel_image()` Step 2.
+- **Kernel module headers**: `Collector.collect_kernel_module()` collects `.h` headers by parsing Kbuild `.*.o.cmd` dependency files, same as `collect_kernel_image()` Step 2.
 
-## Compile Test Internals (`test_sources.py --compile`)
+## Compile Test Internals (`python3 yocto/source_audit.py test --compile`)
 
 The compile test replays original gcc commands with the collected source copy via `_make_shadow_cmd`. Key subtleties:
 

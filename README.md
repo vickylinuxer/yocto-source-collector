@@ -1,111 +1,98 @@
-# yocto-source-collector
+# oss-clearance
 
-Tools for collecting, verifying, and compile-testing the source files that were
-actually compiled into a Yocto image's installed binaries.
+Collect, verify, and audit the source files compiled into a Yocto image — for OSS clearance and license compliance.
 
-## Scripts
+## Prerequisites
 
-| Script | Purpose |
-|--------|---------|
-| `yocto_source_utils.py` | Shared library: package discovery, DWARF extraction, kernel helpers |
-| `collect_sources.py` | Collect sources per installed package in three categories |
-| `verify_sources.py` | Verify collected sources against installed ELF DWARF info |
-| `test_sources.py` | Parse compiler logs and optionally re-compile using collected sources |
-| `report.py` | Generate an interactive HTML report of collected sources |
+- Python 3.10+
+- `readelf` and `objcopy` (from binutils)
+- Cross-compiler toolchain (present in the Yocto build directory)
 
-## How it works
+**Important:**
 
-### Collection (`collect_sources.py`)
-
-Sources are collected into three categories per package, with source-root
-prefixes stripped (e.g. `busybox-1.35.0/archival/...` → `archival/...`):
-
-| Category | Output directory | How identified |
-|----------|-----------------|----------------|
-| **compiled+used** | `<pkg>/` | DWARF CU paths from installed binaries + headers from `debugsources.list` |
-| **compiled+not-used** | `<pkg>/_compiled_not_used/` | In `log.do_compile` but not in DWARF — optional features, static libs, test utils |
-| **never-compiled** | `<pkg>/_never_used/` | In the recipe source tree but never compiled (all non-binary file types) |
-
-For **userspace packages**: uses per-binary DWARF extraction for category 1,
-parses `log.do_compile` for category 2, and walks the source tree for category 3.
-Only files belonging to the package's own recipe are collected (shared-library
-sources from other recipes are filtered out).
-
-For the **kernel image**: finds all `.o` files in the kernel build directory that
-are not owned by any kernel module, then copies the corresponding `.c`/`.S` from
-`kernel-source/`. Also collects headers via Kbuild `.cmd` dependency files.
-
-For **kernel modules**: uses `.mod` files to enumerate the object files, then
-collects the corresponding sources from `kernel-source/`.
-
-Packages with no compiled source (scripts, configs, data) get a
-`NO_COMPILED_SOURCE.txt` marker.
-
-### Verification (`verify_sources.py`)
-
-Re-reads DWARF CU source paths from the installed `.debug` binaries and checks
-that every referenced source file exists in the collected directory.
-
-### Compile test (`test_sources.py`)
-
-Parses `temp/log.do_compile` to extract every `gcc -c` invocation, then:
-
-1. **Coverage check**: reports which compiled sources are (and aren't) in the
-   collected directory.
-2. **Compile test** (`--compile`): re-runs each compile command with the
-   collected source replacing the original and verifies it succeeds.
-
-### Report (`report.py`)
-
-Generates a self-contained interactive HTML report (using Chart.js) showing
-per-package source counts across all three categories, with file-type breakdowns,
-per-category tabs, and filtering/sorting.
+- You **must** source the Yocto build environment before running the script:
+  ```bash
+  source oe-init-build-env <build-dir>
+  ```
+- **Do not** use `sstate` (shared state cache) when building the image. The script needs the full build artifacts (work directories, compile logs, debug info) which are not preserved by sstate. Build with:
+  ```bash
+  SSTATE_DIR="" bitbake <image>
+  ```
+  Or set `SSTATE_MIRRORS = ""` in `local.conf` to ensure a clean build from source.
 
 ## Usage
 
+All commands use the unified CLI: `python3 yocto/source_audit.py <command>`.
+
 ```bash
-# Source the Yocto build environment first (or pass paths explicitly)
+# Collect sources + generate HTML report (recommended)
+python3 yocto/source_audit.py all -b $BUILDDIR -m core-image-sato --clean
 
-# Collect sources
-python3 collect_sources.py -b $BUILDDIR -m core-image-minimal -o ./sources
+# Collect sources only
+python3 yocto/source_audit.py collect -b $BUILDDIR -m core-image-sato --clean
 
-# Verify collected sources against DWARF
-python3 verify_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources
+# Verify collected sources against DWARF debug info
+python3 yocto/source_audit.py verify -b $BUILDDIR -m core-image-sato
 
-# Check coverage (which compiled sources are collected)
-python3 test_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources
+# Check compile-log coverage / re-compile with collected sources
+python3 yocto/source_audit.py test -b $BUILDDIR -m core-image-sato
+python3 yocto/source_audit.py test -b $BUILDDIR -m core-image-sato --compile
+python3 yocto/source_audit.py test -b $BUILDDIR -m core-image-sato --compile -p busybox,dropbear
 
-# Re-compile using collected sources and verify success
-python3 test_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources --compile
-
-# Test specific packages only
-python3 test_sources.py -b $BUILDDIR -m core-image-minimal -s ./sources \
-    --compile -p busybox,dropbear
-
-# Generate interactive HTML report
-python3 report.py -b $BUILDDIR -m core-image-minimal -s ./sources -o report.html
+# Generate HTML report only (requires prior collect)
+python3 yocto/source_audit.py report -b $BUILDDIR -m core-image-sato
 ```
 
-## Common arguments
+### Arguments
 
 | Flag | Description |
 |------|-------------|
 | `-b / --build` | Yocto build directory (`$BUILDDIR`) |
-| `-m / --manifest` | Image name (e.g. `core-image-minimal`) or path to `.manifest` file |
-| `-s / --sources` | Collected sources directory (default: `<build-dir>/sources`) |
+| `-m / --manifest` | Image name (e.g. `core-image-sato`) or path to `.manifest` file |
+| `--machine` | Machine name (auto-detected from build dir) |
+| `--clean` | Remove existing output before collecting |
 | `-v / --verbose` | Verbose output |
 
-## Requirements
+### Output
 
-- Python 3.10+
-- `readelf` (from binutils) — for DWARF extraction in `verify_sources.py`
-- `objcopy` (from binutils) — for `.o` comparison in `test_sources.py`
-- Cross-compiler toolchain must be present (Yocto sysroot in build dir)
+All output goes to `./output/` relative to the current directory:
+
+```
+./output/
+    sources/           # one directory per installed package
+        busybox/       # DWARF-confirmed source files
+        glibc/
+        ...
+    report.html        # interactive HTML report
+```
+
+Packages with no compiled source (scripts, configs, data) have an empty directory.
+
+## How it works
+
+### Source collection
+
+For each installed package, collects the source files that were actually compiled into the installed binaries:
+
+- **Userspace packages**: extracts DWARF compilation-unit paths from installed ELF binaries to identify which source files were compiled and used. Headers are collected from `debugsources.list`.
+- **Kernel image**: finds all `.o` files in the kernel build directory not owned by any module, then collects the corresponding `.c`/`.S` sources and headers from Kbuild `.cmd` dependency files.
+- **Kernel modules**: uses `.mod` files to enumerate object files, then collects the corresponding sources.
+
+### Verification
+
+Re-reads DWARF CU source paths from installed `.debug` binaries and checks that every referenced source file exists in the collected directory.
+
+### Compile test
+
+Parses `temp/log.do_compile` to extract every `gcc -c` invocation, then:
+1. **Coverage check**: reports which compiled sources are present in the collected directory.
+2. **Compile test** (`--compile`): re-runs each compile command with the collected source copy and verifies it succeeds.
+
+### HTML report
+
+Generates a self-contained interactive HTML report (Chart.js) showing per-package source file counts, installed file counts, file-type breakdowns, and DWARF cross-check results. Supports filtering and sorting.
 
 ## Notes
 
-- `.o` files always differ in the compile test because `-fdebug-prefix-map` and
-  `-fmacro-prefix-map` embed the source path in DWARF/macro sections.  This is
-  expected and reported separately as "mismatch", not as a failure.
-- "INCOMPLETE" status means some compile commands target uninstalled binaries or
-  disabled optional features — the uncollected files are correct omissions.
+- `.o` files always differ in the compile test because `-fdebug-prefix-map` embeds source paths in DWARF sections. This is expected and reported as "mismatch", not failure.
+- "INCOMPLETE" status means some compile commands target uninstalled binaries or disabled features — the uncollected files are correct omissions.
