@@ -6,6 +6,7 @@ Works with any Yocto version by reading pkgdata, the rootfs manifest,
 and tmp/work directory structure.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -471,7 +472,13 @@ def discover_packages(
 
         # ── Userspace recipe ──────────────────────────────────────────────────
         debugsources = work_ver / "debugsources.list"
+        compile_log = work_ver / "temp" / "log.do_compile"
         if not debugsources.exists():
+            pkg_type = "no_source"
+        elif not compile_log.exists():
+            # Recipes like glibc-locale have ELF binaries and debugsources
+            # but no compile log — compilation happens in a parent recipe
+            # (e.g. glibc).  Mark as no_source to avoid SKIP in tests.
             pkg_type = "no_source"
         else:
             # Check if this specific sub-package has its own ELF binary.
@@ -485,6 +492,49 @@ def discover_packages(
             recipe=recipe, ver=ver, work_ver=work_ver,
             pkg_type=pkg_type, recipe_prefix=recipe_prefix,
         ))
+
+    # ── Inject synthetic kernel-image-image if not already present ────────
+    # The rootfs manifest typically lists kernel-5.x.y-xxx → kernel-base
+    # (a meta-package with no source), while the actual kernel image is in
+    # kernel-image-image which is NOT in the manifest.  Inject it so that
+    # collect_sources can gather the built-in kernel sources.
+    has_kernel_image = any(p.pkg_type == "kernel_image" for p in packages)
+    if not has_kernel_image:
+        ki_pkgdata = pkgdata_runtime / "kernel-image-image"
+        if ki_pkgdata.exists():
+            data = parse_pkgdata_file(ki_pkgdata)
+            ki_recipe = data.get("PN", "linux-raspberrypi")
+            pv = data.get("PV", "")
+            pr = data.get("PR", "r0")
+            pe = data.get("PE", "")
+            ki_ver = f"{pe}_{pv}-{pr}" if pe else f"{pv}-{pr}" if pv else "unknown"
+            cache_key = (ki_recipe, ki_ver)
+            if cache_key not in _work_cache:
+                _work_cache[cache_key] = find_work_ver_dir(work, ki_recipe, ki_ver)
+            ki_work_ver = _work_cache[cache_key]
+            if ki_work_ver:
+                if ki_work_ver not in _kernel_cache:
+                    kbuild = find_kernel_build_dir(ki_work_ver)
+                    ksrc = find_kernel_src_dir(build_dir, machine)
+                    _kernel_cache[ki_work_ver] = (
+                        KernelInfo(build_dir=kbuild, src_dir=ksrc)
+                        if kbuild and ksrc else None
+                    )
+                ki_kernel = _kernel_cache[ki_work_ver]
+                if ki_kernel:
+                    ki_prefix = f"/usr/src/debug/{ki_recipe}/{ki_ver}/"
+                    packages.append(PackageInfo(
+                        installed_name="kernel-image-image",
+                        yocto_pkg="kernel-image-image",
+                        recipe=ki_recipe, ver=ki_ver,
+                        work_ver=ki_work_ver,
+                        pkg_type="kernel_image",
+                        recipe_prefix=ki_prefix,
+                        kernel=ki_kernel,
+                    ))
+                    if verbose:
+                        print(f"  [INFO] Injected synthetic kernel-image-image "
+                              f"(recipe={ki_recipe}, ver={ki_ver})")
 
     return packages
 
@@ -543,6 +593,38 @@ def is_build_dir(dirname: str) -> bool:
     if re.search(r"^[a-z0-9_]+-(?:poky|oe)-", n):
         return True
     return False
+
+
+# ── Installed files from pkgdata ──────────────────────────────────────────────
+
+def get_installed_files(pkgdata_runtime: Path, yocto_pkg: str,
+                        pkg_split: Path | None = None) -> list[dict]:
+    """Return [{path, size, is_elf}] from pkgdata FILES_INFO.
+
+    If pkg_split is given, each file is checked for ELF magic in the
+    packages-split tree; otherwise is_elf defaults to False.
+    """
+    pkgdata_file = pkgdata_runtime / yocto_pkg
+    if not pkgdata_file.exists():
+        return []
+    data = parse_pkgdata_file(pkgdata_file)
+    raw = data.get("FILES_INFO", "")
+    if not raw:
+        return []
+    try:
+        info = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    result: list[dict] = []
+    for fpath, size in info.items():
+        elf = False
+        if pkg_split:
+            on_disk = pkg_split / fpath.lstrip("/")
+            if on_disk.exists() and not on_disk.is_symlink():
+                elf = is_elf(on_disk)
+        result.append({"path": fpath, "size": size, "is_elf": elf})
+    return result
 
 
 # ── Shared argparse helpers ───────────────────────────────────────────────────

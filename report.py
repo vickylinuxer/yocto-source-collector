@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import json
+import os
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -87,8 +88,48 @@ def _ext_counts(files: list[dict]) -> dict[str, int]:
     return dict(sorted(c.items(), key=lambda x: -x[1]))
 
 
-def collect_data(packages: list, out_dir: Path) -> list[dict]:
+def _dwarf_cross_check(installed_files: list[dict], pkg_split: Path,
+                        cu_file_set: set[str]) -> dict:
+    """Map installed ELF binaries to their compiled+used source files via DWARF.
+
+    Returns {binary_path: [matched_source_paths]} and a reverse mapping
+    {source_path: [binary_paths]}.
+    """
+    binary_sources: dict[str, list[str]] = {}
+    source_binaries: dict[str, list[str]] = {}
+
+    for f in installed_files:
+        if not f["is_elf"]:
+            continue
+        elf_path = pkg_split / f["path"].lstrip("/")
+        if not elf_path.exists():
+            continue
+        debug = yu.find_debug_counterpart(elf_path, pkg_split)
+        if not debug:
+            continue
+        dwarf_srcs = yu.extract_dwarf_cu_sources(debug)
+        matched: list[str] = []
+        for dpath in dwarf_srcs:
+            # Match DWARF path against collected compiled+used file names
+            # Normalize: strip to basename for matching since collected files
+            # use stripped relative paths
+            dbase = os.path.basename(dpath)
+            for cu_path in cu_file_set:
+                if os.path.basename(cu_path) == dbase:
+                    matched.append(cu_path)
+        matched = sorted(set(matched))
+        if matched:
+            binary_sources[f["path"]] = matched
+            for src in matched:
+                source_binaries.setdefault(src, []).append(f["path"])
+
+    return {"binary_sources": binary_sources, "source_binaries": source_binaries}
+
+
+def collect_data(packages: list, out_dir: Path, build_dir: Path,
+                 machine: str) -> list[dict]:
     _SKIP = frozenset({"_compiled_not_used", "_never_used"})
+    pkgdata_runtime = build_dir / "tmp" / "pkgdata" / machine / "runtime"
 
     work_ver_map: dict[str, list[str]] = {}
     for pkg in packages:
@@ -127,6 +168,20 @@ def collect_data(packages: list, out_dir: Path) -> list[dict]:
             peers = work_ver_map.get(str(pkg.work_ver), [])
             shared_with = [p for p in peers if p != pkg.installed_name]
 
+        # ── Installed files from pkgdata ──────────────────────────────────
+        pkg_split = (pkg.work_ver / "packages-split" / pkg.yocto_pkg
+                     if pkg.work_ver else None)
+        installed_files = yu.get_installed_files(
+            pkgdata_runtime, pkg.yocto_pkg,
+            pkg_split=pkg_split)
+
+        # ── DWARF cross-check: binary → sources ─────────────────────────
+        xcheck: dict = {"binary_sources": {}, "source_binaries": {}}
+        elf_count = sum(1 for f in installed_files if f["is_elf"])
+        if elf_count and pkg_split and cu_files:
+            cu_path_set = {f["path"] for f in cu_files}
+            xcheck = _dwarf_cross_check(installed_files, pkg_split, cu_path_set)
+
         rows.append({
             "name":       pkg.installed_name,
             "recipe":     pkg.recipe,
@@ -151,6 +206,13 @@ def collect_data(packages: list, out_dir: Path) -> list[dict]:
             "same_as":    same_as.stem.replace("SAME_AS_", "") if same_as else None,
             "coverage":   coverage,
             "shared_with": shared_with,
+            # Installed files
+            "installed_files": installed_files[:500],
+            "installed_total": len(installed_files),
+            "installed_elf":   elf_count,
+            # Cross-check: binary→sources, source→binaries
+            "binary_sources":  xcheck["binary_sources"],
+            "source_binaries": xcheck["source_binaries"],
         })
     return rows
 
@@ -273,6 +335,7 @@ tr.detail-row td{{padding:0;border-top:none}}
   <div class="card c6"><div class="val">{total_cnu}</div><div class="lbl">Compiled, not used</div></div>
   <div class="card c2"><div class="val">{total_nu}</div><div class="lbl">Never compiled</div></div>
   <div class="card c1"><div class="val">{total_all}</div><div class="lbl">Total source files</div></div>
+  <div class="card" style="border-left:3px solid #2980b9"><div class="val" style="color:#2980b9">{total_installed}</div><div class="lbl">Installed files</div></div>
 </div>
 
 <!-- Charts -->
@@ -308,6 +371,7 @@ tr.detail-row td{{padding:0;border-top:none}}
       <th data-col="cu_total" style="text-align:right">Compiled+Used <span class="si">↕</span></th>
       <th data-col="cnu_total" style="text-align:right">Comp.Not-Used <span class="si">↕</span></th>
       <th data-col="nu_total" style="text-align:right">Never Compiled <span class="si">↕</span></th>
+      <th data-col="installed_total" style="text-align:right">Installed <span class="si">↕</span></th>
       <th>Distribution</th>
     </tr></thead>
     <tbody id="tblBody"></tbody>
@@ -428,8 +492,24 @@ function fileListFiltered(files, color, total, panelId){{
   return `<div class="file-list" id="fl-${{panelId}}">${{items}}</div>${{cap}}`;
 }}
 
-function pane(id, label, color, files, ext, total, active){{
+function pane(id, label, color, files, ext, total, active, srcBinMap){{
   const tfr = makeTypeFilter(files, id);
+  // If srcBinMap provided, annotate files with their binary
+  let fileItems;
+  if(srcBinMap && Object.keys(srcBinMap).length){{
+    fileItems = files.map(f=>{{
+      const m=f.match(/\\.([^.]+)$/); const ext=m?'.'+m[1]:'(none)';
+      const bins = srcBinMap[f];
+      const annot = bins && bins.length
+        ? ` <span style="color:#2980b9;font-size:.68rem;font-weight:500">← ${{bins.join(', ')}}</span>` : '';
+      return `<div style="color:${{color}}" data-ext="${{ext}}">${{f}}${{annot}}</div>`;
+    }}).join('');
+    const cap = total>files.length
+      ? `<div class="cap-note">Showing ${{files.length}} of ${{total}} files</div>`:'';
+    fileItems = `<div class="file-list" id="fl-${{id}}">${{fileItems}}</div>${{cap}}`;
+  }} else {{
+    fileItems = fileListFiltered(files, color, total, id);
+  }}
   return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}">
     <div style="color:var(--muted);font-size:.78rem;margin-bottom:8px">
       <strong style="color:${{color}}">${{total.toLocaleString()}}</strong> files
@@ -442,9 +522,41 @@ function pane(id, label, color, files, ext, total, active){{
       </div>
       <div class="detail-section" style="grid-column:span 2">
         <h4 style="color:${{color}}">${{label}} <span class="cnt">${{total}}</span></h4>
-        ${{fileListFiltered(files, color, total, id)}}
+        ${{fileItems}}
       </div>
     </div>
+  </div>`;
+}}
+
+function fmtSize(bytes){{
+  if(bytes<1024) return bytes+' B';
+  if(bytes<1024*1024) return (bytes/1024).toFixed(1)+' KB';
+  return (bytes/1024/1024).toFixed(1)+' MB';
+}}
+
+function installedPane(id, files, total, elfCount, binarySources, active){{
+  if(!files||!files.length) return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}"><em style="color:#ccc">No installed files</em></div>`;
+  const items = files.map(f=>{{
+    const elfBadge = f.is_elf ? ' <span class="badge" style="background:#2980b9;font-size:.65rem">ELF</span>' : '';
+    const srcs = binarySources[f.path];
+    let srcList = '';
+    if(srcs && srcs.length){{
+      srcList = `<div style="margin-left:18px;color:#27ae60;font-size:.7rem">${{srcs.map(s=>'↳ '+s).join('<br>')}}</div>`;
+    }}
+    return `<div style="font-family:monospace;font-size:.74rem;line-height:1.75">
+      <span style="color:var(--text)">${{f.path}}</span>
+      <span style="color:var(--muted);font-size:.68rem;margin-left:6px">${{fmtSize(f.size)}}</span>
+      ${{elfBadge}}${{srcList}}</div>`;
+  }}).join('');
+  const cap = total>files.length
+    ? `<div class="cap-note">Showing ${{files.length}} of ${{total}} files</div>`:'';
+  const mapped = Object.keys(binarySources).length;
+  return `<div class="cat-pane${{active?' active':''}}" id="cp-${{id}}">
+    <div style="color:var(--muted);font-size:.78rem;margin-bottom:8px">
+      <strong style="color:#2980b9">${{total}}</strong> files · <strong>${{elfCount}}</strong> ELF binaries${{mapped?' · <strong>'+mapped+'</strong> with source mapping':''}}
+    </div>
+    <div class="detail-section" style="max-height:300px;overflow-y:auto">${{items}}</div>
+    ${{cap}}
   </div>`;
 }}
 
@@ -464,9 +576,10 @@ function renderDetail(d, idx){{
     ${{d.coverage?`<span>Compile log: <strong>${{d.coverage.covered}}/${{d.coverage.compile_total}}</strong> in binary</span>`:''}}
   </div>`;
 
-  const cuPane  = pane(`cu-${{idx}}`,  'Compiled &amp; used files',  '#27ae60', d.cu_files,  d.cu_ext,  d.cu_total,  true);
-  const cnuPane = pane(`cnu-${{idx}}`, 'Compiled, not-used files',   '#e07b39', d.cnu_files, d.cnu_ext, d.cnu_total, false);
-  const nuPane  = pane(`nu-${{idx}}`,  'Never-compiled files',       '#9b59b6', d.nu_files,  d.nu_ext,  d.nu_total,  false);
+  const cuPane  = pane(`cu-${{idx}}`,  'Compiled &amp; used files',  '#27ae60', d.cu_files,  d.cu_ext,  d.cu_total,  true, d.source_binaries);
+  const cnuPane = pane(`cnu-${{idx}}`, 'Compiled, not-used files',   '#e07b39', d.cnu_files, d.cnu_ext, d.cnu_total, false, null);
+  const nuPane  = pane(`nu-${{idx}}`,  'Never-compiled files',       '#9b59b6', d.nu_files,  d.nu_ext,  d.nu_total,  false, null);
+  const instPane = installedPane(`inst-${{idx}}`, d.installed_files, d.installed_total, d.installed_elf, d.binary_sources||{{}}, false);
 
   return `<div class="detail-panel open">
     ${{info}}${{shared}}
@@ -477,8 +590,10 @@ function renderDetail(d, idx){{
         Compiled Not-Used <strong style="color:#e07b39">${{d.cnu_total}}</strong></div>
       <div class="cat-tab" data-pane="cp-nu-${{idx}}" onclick="switchTab(this)">
         Never Compiled <strong style="color:#9b59b6">${{d.nu_total}}</strong></div>
+      <div class="cat-tab" data-pane="cp-inst-${{idx}}" onclick="switchTab(this)">
+        Installed Files <strong style="color:#2980b9">${{d.installed_total}}</strong></div>
     </div>
-    ${{cuPane}}${{cnuPane}}${{nuPane}}
+    ${{cuPane}}${{cnuPane}}${{nuPane}}${{instPane}}
   </div>`;
 }}
 
@@ -519,9 +634,10 @@ function renderTable(){{
       <td class="num" style="color:#27ae60">${{fmt(d.cu_total)}}</td>
       <td class="num" style="color:#e07b39">${{fmt(d.cnu_total)}}</td>
       <td class="num" style="color:#9b59b6">${{fmt(d.nu_total)}}</td>
+      <td class="num" style="color:#2980b9">${{fmt(d.installed_total)}}</td>
       <td>${{dist}}</td>
     </tr>
-    <tr class="detail-row"><td colspan="7">${{renderDetail(d,idx)}}</td></tr>`;
+    <tr class="detail-row"><td colspan="8">${{renderDetail(d,idx)}}</td></tr>`;
   }}).join('');
 
   tbody.querySelectorAll('tr.data-row').forEach(tr=>{{
@@ -584,11 +700,12 @@ def main():
     packages = yu.discover_packages(manifest_path, build_dir, machine, args.verbose)
 
     print(f"Collecting data for {len(packages)} packages…")
-    rows = collect_data(packages, out_dir)
+    rows = collect_data(packages, out_dir, build_dir, machine)
 
     total_cu  = sum(r["cu_total"]  for r in rows)
     total_cnu = sum(r["cnu_total"] for r in rows)
     total_nu  = sum(r["nu_total"]  for r in rows)
+    total_installed = sum(r["installed_total"] for r in rows)
 
     html = _HTML.format(
         image      = image,
@@ -599,6 +716,7 @@ def main():
         total_cnu  = f"{total_cnu:,}",
         total_nu   = f"{total_nu:,}",
         total_all  = f"{total_cu + total_cnu + total_nu:,}",
+        total_installed = f"{total_installed:,}",
         data_json  = json.dumps(rows, indent=None),
     )
 
@@ -608,6 +726,7 @@ def main():
     print(f"  Compiled+Not-Used : {total_cnu:,}")
     print(f"  Never Compiled    : {total_nu:,}")
     print(f"  Total             : {total_cu + total_cnu + total_nu:,}")
+    print(f"  Installed files   : {total_installed:,}")
 
 
 if __name__ == "__main__":
