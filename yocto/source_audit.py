@@ -4064,7 +4064,9 @@ class Reporter:
                 cu_files = _list_files_in(pkg_dir)
                 for f in cu_files:
                     rel = f["path"]
-                    if rel in source_binaries:
+                    if has_dwarf:
+                        # If DWARF confirmed any .c files for this package,
+                        # all collected files (including .h headers) are needed
                         deselected = "False"
                     elif is_kernel and not has_dwarf and rel in kernel_compiled:
                         deselected = "False"
@@ -4240,10 +4242,13 @@ class Reporter:
                 continue
             pkg_dir = self.out_dir / name
             cu_files = _list_files_in(pkg_dir)
+            has_dwarf = bool(source_binaries)
             for f in cu_files:
                 rel = f["path"]
                 ext = f["ext"]
-                if rel in source_binaries:
+                if has_dwarf:
+                    # DWARF confirmed .c files; all collected files
+                    # (including .h headers) are needed
                     confirmed = "Yes"
                 elif is_kernel:
                     confirmed = "Yes"
