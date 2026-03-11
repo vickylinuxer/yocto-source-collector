@@ -3243,32 +3243,48 @@ def _list_files_in(d: Path) -> list[dict]:
 def _build_used_files_set(row: dict, pkg: "PackageInfo | None") -> "set[str] | None":
     """Build set of confirmed-used source file paths (relative to collected dir).
 
-    Returns None when ALL collected files are confirmed (kernel packages,
-    or no evidence available — conservative assumption).
+    Returns None when ALL collected files are confirmed (kernel_image only).
+    Returns a set of confirmed paths for all other package types.
 
     Evidence sources:
       - DWARF CU paths: per-package (from this package's ELF binaries). Always safe.
       - debugsources.list: per-recipe. Only used for single-package recipes (no siblings).
       - compile log: per-recipe. Only used for single-package recipes (no siblings).
+      - kernel_mod_obj_rels: per-module .o → .c/.S mapping from .mod files.
 
     For split-package recipes (shared work_ver), only per-package DWARF evidence
     is used — recipe-level sources would falsely confirm files that belong to
     sibling packages.
+
+    For kernel modules, only the .c/.S compiled sources (from .mod → .o mapping)
+    are confirmed. Headers from .cmd deps are shared kernel infrastructure and
+    are deselected (they are already confirmed in kernel-image-image).
     """
     pkg_type = row["type"]
 
-    # Kernel packages: collector only collects evidence-backed files
-    if pkg_type in ("kernel_image", "kernel_module"):
+    # kernel_image: all files are the master set, all confirmed
+    if pkg_type == "kernel_image":
         return None
 
-    if pkg_type != "userspace" or not pkg or not pkg.work_ver:
-        return None  # No evidence → conservative: all confirmed
+    # Kernel modules: only .c/.S from .mod obj_rels are confirmed
+    if pkg_type == "kernel_module":
+        if not pkg or not pkg.kernel_mod_obj_rels:
+            return set()  # No .mod evidence → nothing confirmed
+        evidence: set[str] = set()
+        for obj_rel in pkg.kernel_mod_obj_rels:
+            p = Path(obj_rel)
+            for ext in (".c", ".S"):
+                evidence.add(str(p.parent / (p.stem + ext)))
+        return evidence
+
+    if pkg_type != "userspace" or not pkg:
+        return set()  # Unknown type → nothing confirmed
 
     has_siblings = bool(row.get("shared_with"))
-    evidence: set[str] = set()
+    evidence = set()
 
     # Stage 1: debugsources.list (per-recipe — only for single-package recipes)
-    if not has_siblings:
+    if not has_siblings and pkg.work_ver:
         dbgsrc = pkg.work_ver / "debugsources.list"
         if dbgsrc.exists():
             entries = read_debugsources(dbgsrc)
@@ -3283,7 +3299,7 @@ def _build_used_files_set(row: dict, pkg: "PackageInfo | None") -> "set[str] | N
         evidence.update(dwarf_cu_rels)
 
     # Stage 3: compile log (per-recipe — only for single-package recipes)
-    if not has_siblings:
+    if not has_siblings and pkg.work_ver:
         log = pkg.work_ver / "temp" / "log.do_compile"
         if log.exists():
             cwd = _get_initial_cwd(pkg.work_ver)
@@ -3295,7 +3311,7 @@ def _build_used_files_set(row: dict, pkg: "PackageInfo | None") -> "set[str] | N
                     pass
 
     if not evidence:
-        return None  # No evidence → conservative: all confirmed
+        return set()  # No evidence → nothing confirmed
 
     return evidence
 
