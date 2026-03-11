@@ -44,7 +44,8 @@ except ImportError:
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SOURCE_EXTS = {".c", ".h", ".S", ".s", ".cpp", ".cc", ".cxx", ".C"}
+SOURCE_EXTS = {".c", ".h", ".S", ".s", ".cpp", ".cc", ".cxx", ".C",
+               ".hpp", ".hxx", ".hh", ".H"}
 
 KERNEL_IMAGE_GLOBS = ("bzImage*", "zImage*", "Image", "vmlinuz*",
                       "uImage*", "fitImage*", "vmlinux")
@@ -1455,6 +1456,68 @@ def check_coverage(pkg, sources_dir: Path,
             continue
         stripped = strip_src_root(str(rel))
         if any((d / stripped).exists() for d in src_dirs):
+            covered.append(stripped)
+        else:
+            not_coll.append(stripped)
+            if cmd.src.exists():
+                not_coll_abs[stripped] = cmd.src
+
+    total = len(cmds)
+    return {
+        "status":   "OK" if not not_coll else "INCOMPLETE",
+        "total":    total,
+        "covered":  len(covered),
+        "not_collected": not_coll,
+        "not_collected_abs": not_coll_abs,
+        "outside":  outside,
+    }
+
+
+def check_coverage_kernel(pkg, sources_dir: Path) -> dict:
+    """Coverage check for kernel_image packages.
+
+    Parses the kernel compile log and checks which compiled sources are
+    already collected.  Sources are resolved relative to the kernel source
+    dir (work-shared) rather than work_ver.
+    """
+    if not pkg.work_ver:
+        return {"status": "NO_WORK_DIR"}
+    if not pkg.kernel or not pkg.kernel.src_dir:
+        return {"status": "NO_KERNEL_SRC"}
+    log_file = pkg.work_ver / "temp" / "log.do_compile"
+    if not log_file.exists():
+        return {"status": "NO_LOG"}
+    initial_cwd = _get_initial_cwd(pkg.work_ver)
+    cmds = parse_compile_log(log_file, initial_cwd)
+    if not cmds:
+        return {"status": "NO_CMDS"}
+
+    pkg_out = sources_dir / pkg.installed_name
+    src_dir = pkg.kernel.src_dir
+    build_dir = pkg.kernel.build_dir
+
+    covered:   list[str] = []
+    not_coll:  list[str] = []
+    not_coll_abs: dict[str, Path] = {}
+    outside:   list[str] = []
+
+    for cmd in cmds:
+        # Kernel sources are under src_dir (work-shared) or build_dir
+        resolved_rel = None
+        for base in (src_dir, build_dir):
+            if base is None:
+                continue
+            try:
+                resolved_rel = str(cmd.src.relative_to(base))
+                break
+            except ValueError:
+                continue
+        if resolved_rel is None:
+            if cmd.src.exists():
+                outside.append(str(cmd.src))
+            continue
+        stripped = strip_src_root(resolved_rel)
+        if (pkg_out / stripped).exists():
             covered.append(stripped)
         else:
             not_coll.append(stripped)
@@ -3258,27 +3321,53 @@ def _get_source_tree_files(pkg: "PackageInfo | None") -> "list[dict] | None":
     if pkg.pkg_type == "kernel_module":
         return None
     # Determine source directory
+    build_dir: Path | None = None
     if pkg.pkg_type == "kernel_image" and pkg.kernel:
         src_dir = pkg.kernel.src_dir
     elif pkg.work_ver:
         src_dir = _find_src_subdir(pkg.work_ver, pkg.recipe, ver=pkg.ver)
+        # Detect out-of-tree build directory (B != S)
+        if src_dir:
+            for child in pkg.work_ver.iterdir():
+                if child.is_dir() and child != src_dir and is_build_dir(child.name):
+                    build_dir = child
+                    break
     else:
         return None
     if not src_dir or not src_dir.is_dir():
         return None
-    cache_key = str(src_dir)
+    cache_key = str(src_dir) + (f"+{build_dir}" if build_dir else "")
     if cache_key in _src_tree_cache:
         return _src_tree_cache[cache_key]
+    seen_rels: set[str] = set()
     result: list[dict] = []
     for f in src_dir.rglob("*"):
         if not f.is_file():
             continue
+        # Skip quilt .pc/ patch backup directories (pre-patch file copies)
+        rel = str(f.relative_to(src_dir))
+        if rel.startswith(".pc/") or "/.pc/" in rel:
+            continue
         ext = f.suffix.lower()
         if ext not in SOURCE_EXTS:
             continue
-        rel = str(f.relative_to(src_dir))
+        seen_rels.add(rel)
         result.append({"path": rel, "ext": ext or "(no ext)",
                         "abs": str(f)})
+    # Also scan out-of-tree build directory for generated source files
+    if build_dir and build_dir.is_dir():
+        for f in build_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = str(f.relative_to(build_dir))
+            if rel in seen_rels:
+                continue
+            ext = f.suffix.lower()
+            if ext not in SOURCE_EXTS:
+                continue
+            seen_rels.add(rel)
+            result.append({"path": rel, "ext": ext or "(no ext)",
+                            "abs": str(f)})
     _src_tree_cache[cache_key] = result
     return result
 
@@ -4859,18 +4948,20 @@ def cmd_all(args) -> int:
             print("  SKIP: no compiled source")
             summary[pkg.installed_name] = "SKIP"
             continue
-        if pkg.pkg_type in ("kernel_image", "kernel_module"):
-            summary[pkg.installed_name] = "SKIP(kernel)"
+        if pkg.pkg_type == "kernel_module":
+            summary[pkg.installed_name] = "SKIP(kernel_module)"
             continue
-        if pkg.pkg_type != "userspace":
-            continue
-
-        if pkg.recipe in recipe_cov_cache:
-            cov = recipe_cov_cache[pkg.recipe]
+        if pkg.pkg_type == "kernel_image":
+            cov = check_coverage_kernel(pkg, out_dir)
+        elif pkg.pkg_type == "userspace":
+            if pkg.recipe in recipe_cov_cache:
+                cov = recipe_cov_cache[pkg.recipe]
+            else:
+                all_names = recipe_all_names.get(pkg.recipe, [])
+                cov = check_coverage(pkg, out_dir, all_pkg_names=all_names)
+                recipe_cov_cache[pkg.recipe] = cov
         else:
-            all_names = recipe_all_names.get(pkg.recipe, [])
-            cov = check_coverage(pkg, out_dir, all_pkg_names=all_names)
-            recipe_cov_cache[pkg.recipe] = cov
+            continue
 
         status = cov.get("status", "?")
         summary[pkg.installed_name] = status
