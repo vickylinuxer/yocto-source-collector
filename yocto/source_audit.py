@@ -3661,6 +3661,74 @@ def _find_abs_source_path(rel_path: str, pkg: "PackageInfo") -> str:
     return rel_path
 
 
+_GCC_VER_RE = re.compile(r'^gcc-(\d+\.\d+\.\d+)/(.*)')
+
+
+def _resolve_csv_abs_path(abs_path: str, rel_path: str,
+                          pkg: "PackageInfo") -> str:
+    """If *abs_path* doesn't exist on disk, try to find the correct location.
+
+    Handles three categories of mismatched paths:
+    1. gcc-runtime sources embedded under another recipe's src_dir
+    2. Recipe-sysroot headers (usr/include/, usr/lib/)
+    3. Build-generated files found by filename search
+    """
+    if os.path.isfile(abs_path):
+        return abs_path
+    if not pkg or not pkg.work_ver:
+        return abs_path
+
+    work_ver = pkg.work_ver
+
+    # 1. gcc work-shared: rel starts with gcc-X.Y.Z/
+    m = _GCC_VER_RE.match(rel_path)
+    if m:
+        gcc_ver, gcc_rel = m.group(1), m.group(2)
+        # work_ver is .../tmp/work/<arch>/<recipe>/<ver>/
+        # work-shared is .../tmp/work-shared/
+        tmp = work_ver.parent.parent.parent.parent  # .../tmp/
+        ws = tmp / "work-shared"
+        if ws.is_dir():
+            for d in ws.iterdir():
+                if d.name.startswith(f"gcc-{gcc_ver}"):
+                    candidate = d / f"gcc-{gcc_ver}" / gcc_rel
+                    if candidate.is_file():
+                        return str(candidate)
+        return abs_path
+
+    # 2. Sysroot headers: usr/include/ or usr/lib/
+    if rel_path.startswith(("usr/include/", "usr/lib/")):
+        candidate = work_ver / "recipe-sysroot" / rel_path
+        if candidate.is_file():
+            return str(candidate)
+
+    # 3. General fallback: search by filename in src_dir + build_dir
+    filename = os.path.basename(rel_path)
+    src_dir = _find_src_subdir(work_ver, pkg.recipe, ver=pkg.ver)
+    if src_dir:
+        for f in src_dir.rglob(filename):
+            if f.is_file():
+                return str(f)
+    for child in work_ver.iterdir():
+        if child.is_dir() and is_build_dir(child.name):
+            for f in child.rglob(filename):
+                if f.is_file():
+                    return str(f)
+
+    # 4. work-shared fallback for gcc-runtime and similar shared-source recipes
+    if pkg.recipe and "gcc" in pkg.recipe:
+        tmp = work_ver.parent.parent.parent.parent
+        ws = tmp / "work-shared"
+        if ws.is_dir():
+            for d in ws.iterdir():
+                if d.is_dir() and d.name.startswith("gcc-"):
+                    for f in d.rglob(filename):
+                        if f.is_file():
+                            return str(f)
+
+    return abs_path
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Auditor — comprehensive completeness audit
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4400,8 +4468,10 @@ class Reporter:
                         rel = f["path"]
                         deselected = ("False" if rel in collected_rels
                                       else "True")
+                        abs_p = (_resolve_csv_abs_path(f["abs"], rel, pkg)
+                                 if pkg else f["abs"])
                         writer.writerow([row_id, recipe, version, name,
-                                         deselected, f["abs"]])
+                                         deselected, abs_p])
                         row_id += 1
                     # Append collected files not in source tree (build-dir
                     # generated files).
@@ -4410,6 +4480,8 @@ class Reporter:
                         if rel not in tree_rels:
                             abs_path = (_find_abs_source_path(rel, pkg)
                                         if pkg else rel)
+                            abs_path = (_resolve_csv_abs_path(abs_path, rel, pkg)
+                                        if pkg else abs_path)
                             writer.writerow([row_id, recipe, version, name,
                                              "False", abs_path])
                             row_id += 1
@@ -4419,6 +4491,8 @@ class Reporter:
                         rel = f["path"]
                         abs_path = (_find_abs_source_path(rel, pkg)
                                     if pkg else rel)
+                        abs_path = (_resolve_csv_abs_path(abs_path, rel, pkg)
+                                    if pkg else abs_path)
                         writer.writerow([row_id, recipe, version, name,
                                          "False", abs_path])
                         row_id += 1
